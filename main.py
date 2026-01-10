@@ -30,7 +30,7 @@ def init_db():
                      TEXT
                  )''')
 
-    # Battery Inventory/History Table
+    # Updated Battery Table with Ticket ID, Vehicle No, and Purchase Date
     c.execute('''CREATE TABLE IF NOT EXISTS batteries
                  (
                      serial_no
@@ -43,9 +43,15 @@ def init_db():
                      TEXT,
                      sold_date
                      TEXT,
+                     date_of_purchase
+                     TEXT,
                      warranty_expiry
                      TEXT,
                      current_owner_phone
+                     TEXT,
+                     ticket_id
+                     TEXT,
+                     vehicle_no
                      TEXT
                  )''')
 
@@ -71,14 +77,20 @@ def init_db():
                      TEXT
                  )''')
 
-    # --- MIGRATION CHECK ---
-    c.execute("PRAGMA table_info(exchanges)")
+    # --- MIGRATION CHECK FOR NEW FIELDS ---
+    c.execute("PRAGMA table_info(batteries)")
     columns = [column[1] for column in c.fetchall()]
-    if 'action_taken' not in columns:
-        try:
-            c.execute("ALTER TABLE exchanges ADD COLUMN action_taken TEXT")
-        except Exception as e:
-            print(f"Migration notice: {e}")
+    new_fields = {
+        'ticket_id': 'TEXT',
+        'vehicle_no': 'TEXT',
+        'date_of_purchase': 'TEXT'
+    }
+    for field, ftype in new_fields.items():
+        if field not in columns:
+            try:
+                c.execute(f"ALTER TABLE batteries ADD COLUMN {field} {ftype}")
+            except Exception as e:
+                print(f"Migration notice: {e}")
 
     conn.commit()
     conn.close()
@@ -88,31 +100,25 @@ def get_db_connection():
     return sqlite3.connect(DB_FILE)
 
 
-def cleanup_expired_data():
-    """Automatically deletes records where the warranty has expired."""
-    conn = get_db_connection()
-    c = conn.cursor()
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    try:
-        c.execute("SELECT serial_no FROM batteries WHERE warranty_expiry < ? AND warranty_expiry IS NOT NULL", (today,))
-        expired_batteries = [row[0] for row in c.fetchall()]
-
-        if expired_batteries:
-            placeholders = ','.join(['?'] * len(expired_batteries))
-            c.execute(f'''DELETE FROM exchanges 
-                          WHERE old_battery_serial IN ({placeholders}) 
-                          OR new_battery_serial IN ({placeholders})''',
-                      expired_batteries + expired_batteries)
-            c.execute(f"DELETE FROM batteries WHERE serial_no IN ({placeholders})", expired_batteries)
-            conn.commit()
-    except Exception as e:
-        print(f"Cleanup Error: {e}")
-    finally:
-        conn.close()
-
-
 # --- HELPER FUNCTIONS ---
+
+def calculate_age(purchase_date_str):
+    """Calculates days and months since purchase."""
+    if not purchase_date_str:
+        return "N/A"
+    try:
+        p_date = datetime.strptime(purchase_date_str, "%Y-%m-%d")
+        today = datetime.now()
+        diff = today - p_date
+
+        days = diff.days
+        months = days // 30
+        remaining_days = days % 30
+
+        return f"{days} days (~{months} months, {remaining_days} days)"
+    except:
+        return "Invalid Date"
+
 
 def generate_otp():
     """Generates a 4-digit OTP."""
@@ -146,6 +152,21 @@ def process_pickup_db(serial, phone):
         conn.close()
 
 
+# --- CALLBACKS TO FIX BUTTON PRESS ISSUES ---
+def verify_claim_otp():
+    if st.session_state.claim_otp_input == st.session_state.current_otp:
+        st.session_state.otp_verified = True
+    else:
+        st.error("Invalid OTP. Please try again.")
+
+
+def verify_pickup_otp():
+    if st.session_state.pickup_otp_input == st.session_state.current_otp:
+        st.session_state.pickup_verified = True
+    else:
+        st.error("Invalid OTP. Please try again.")
+
+
 # --- UI PAGES ---
 
 def page_dashboard():
@@ -165,15 +186,19 @@ def page_dashboard():
     st.markdown("---")
     st.subheader("🛠️ Active Service Management")
     in_service = pd.read_sql("""
-                             SELECT serial_no, current_owner_phone, status
+                             SELECT serial_no, current_owner_phone, status, date_of_purchase, ticket_id, vehicle_no
                              FROM batteries
                              WHERE status IN ('pending', 'ready_for_pickup')
                              """, conn)
 
     if not in_service.empty:
         for index, row in in_service.iterrows():
+            age_info = calculate_age(row['date_of_purchase'])
             with st.expander(
-                    f"Battery: {row['serial_no']} | Customer: {row['current_owner_phone']} | Current: {row['status'].upper()}"):
+                    f"Battery: {row['serial_no']} | Vehicle: {row['vehicle_no'] or 'N/A'} | Status: {row['status'].upper()}"):
+                st.write(f"**Ticket ID:** {row['ticket_id'] or 'N/A'}")
+                st.write(f"**Age since Purchase:** {age_info}")
+
                 status_options = ['pending', 'ready_for_pickup', 'returned_faulty']
                 new_status = st.selectbox(
                     f"Update status for {row['serial_no']}",
@@ -186,12 +211,6 @@ def page_dashboard():
                     if st.button(f"Save Status for {row['serial_no']}", key=f"btn_{row['serial_no']}"):
                         c = conn.cursor()
                         c.execute("UPDATE batteries SET status=? WHERE serial_no=?", (new_status, row['serial_no']))
-                        if new_status == 'returned_faulty':
-                            c.execute(
-                                "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row['serial_no'], "N/A",
-                                 row['current_owner_phone'], "MARKED_FAULTY",
-                                 "Technician marked as faulty via Dashboard."))
                         conn.commit()
                         st.success(f"Status updated to {new_status}!")
                         st.rerun()
@@ -214,8 +233,76 @@ def page_service():
         st.session_state.otp_verified = False
     if 'current_otp' not in st.session_state:
         st.session_state.current_otp = None
+    if 'exchange_complete' not in st.session_state:
+        st.session_state.exchange_complete = False
 
     with tab_claim:
+        if st.session_state.exchange_complete:
+            st.success("Exchange Logged Successfully!")
+            summary = st.session_state.last_exchange_summary
+
+            # Professionally formatted HTML Receipt
+            html_receipt = f"""
+            <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; padding: 20px; border: 1px solid #eee; max-width: 500px; margin: auto; background-color: white; color: #333;">
+                <div style="text-align: center; border-bottom: 2px solid #ed1c24; padding-bottom: 10px;">
+                    <h2 style="margin: 0; color: #ed1c24;">{SHOP_NAME}</h2>
+                    <p style="margin: 5px 0; font-size: 14px;">Authorized Exide Care Dealer</p>
+                </div>
+
+                <div style="margin: 20px 0;">
+                    <h4 style="border-bottom: 1px solid #eee; padding-bottom: 5px;">WARRANTY TRANSACTION RECEIPT</h4>
+                    <table style="width: 100%; font-size: 14px; border-collapse: collapse;">
+                        <tr><td style="padding: 5px 0; color: #666;">Customer Name:</td><td style="padding: 5px 0; font-weight: bold;">{summary['cust_name']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">Vehicle Reg No:</td><td style="padding: 5px 0; font-weight: bold;">{summary['vehicle_no']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">New Battery SN:</td><td style="padding: 5px 0; font-weight: bold;">{summary['new_serial']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">Old Battery SN:</td><td style="padding: 5px 0; font-weight: bold;">{summary['old_serial']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">Exide Ticket ID:</td><td style="padding: 5px 0; font-weight: bold;">{summary['ticket_id']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">Battery Model:</td><td style="padding: 5px 0; font-weight: bold;">{summary['new_model']}</td></tr>
+                        <tr><td style="padding: 5px 0; color: #666;">Purchase Date:</td><td style="padding: 5px 0; font-weight: bold;">{summary['purchase_date']}</td></tr>
+                    </table>
+                </div>
+
+                <div style="margin-top: 20px; padding: 10px; background-color: #f9f9f9; border-radius: 4px; font-size: 13px;">
+                    <strong>Technician Notes:</strong><br>
+                    {summary['notes']}
+                </div>
+
+                <div style="margin-top: 30px; text-align: center; font-size: 12px; color: #999; border-top: 1px solid #eee; padding-top: 10px;">
+                    Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}<br>
+                    Thank you for choosing Exide Care!
+                </div>
+            </div>
+            """
+
+            st.markdown("### 📄 Transaction Receipt")
+            st.components.v1.html(html_receipt, height=500, scrolling=True)
+
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                if st.button("🖨️ Print Receipt"):
+                    # Print trigger with refined styling
+                    st.components.v1.html(f"""
+                        <script>
+                            var printWin = window.open('', '', 'width=800,height=900');
+                            printWin.document.write('<html><head><title>Receipt - {summary['new_serial']}</title></head><body>');
+                            printWin.document.write(`{html_receipt}`);
+                            printWin.document.write('<script>window.onload = function() {{ window.print(); window.close(); }}<\\/script>');
+                            printWin.document.write('</body></html>');
+                            printWin.document.close();
+                        </script>
+                    """, height=0)
+
+            with col_p2:
+                st.download_button("💾 Save as HTML", html_receipt, file_name=f"receipt_{summary['new_serial']}.html",
+                                   mime="text/html")
+
+            if st.button("Process Another Claim"):
+                st.session_state.exchange_complete = False
+                st.session_state.otp_verified = False
+                st.session_state.current_otp = None
+                st.rerun()
+            return
+
         st.subheader("1. Register Faulty Battery")
 
         with st.form("check_form"):
@@ -237,8 +324,6 @@ def page_service():
                     if expiry and datetime.now().strftime("%Y-%m-%d") > expiry:
                         st.warning(f"⚠️ Warning: This battery warranty expired on {expiry}")
                         valid_warranty = False
-                else:
-                    st.info("New serial detected. Registering customer to this serial.")
 
                 if valid_warranty:
                     otp = generate_otp()
@@ -253,14 +338,9 @@ def page_service():
 
         if st.session_state.current_otp and not st.session_state.otp_verified and st.session_state.get(
                 'workflow') == "CLAIM":
-            otp_input = st.text_input("Enter OTP for Warranty Claim", key="claim_otp_field")
-            if st.button("Verify OTP", key="claim_verify_btn"):
-                if otp_input == st.session_state.current_otp:
-                    st.session_state.otp_verified = True
-                    st.success("Identity Verified!")
-                    st.rerun()
-                else:
-                    st.error("Invalid OTP.")
+            st.text_input("Enter OTP for Warranty Claim", key="claim_otp_input")
+            # Direct verification button with callback to ensure single-click state update
+            st.button("Verify OTP", key="claim_verify_btn", on_click=verify_claim_otp)
 
         if st.session_state.otp_verified and st.session_state.get('workflow') == "CLAIM":
             st.subheader("Resolution")
@@ -269,48 +349,76 @@ def page_service():
 
             if action == "Issue New Replacement Battery":
                 with st.form("exchange_final"):
-                    cust_name = st.text_input("Customer Name")
-                    new_serial = st.text_input("New Battery Serial Number (Scanning)")
-                    new_model = st.selectbox("Battery Model",
-                                             ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
-                    warranty_months = st.number_input("New Warranty Duration (Months)", min_value=12, value=48)
-                    notes = st.text_area("Technician Notes", "Verified Dead Cell. Replaced with New Battery.")
+                    col_a, col_b = st.columns(2)
+                    cust_name = col_a.text_input("Customer Name")
+                    vehicle_no = col_b.text_input("Vehicle Registration No.")
+
+                    col_c, col_d = st.columns(2)
+                    new_serial = col_c.text_input("New Battery Serial Number")
+                    ticket_id = col_d.text_input("Exide Ticket ID")
+
+                    col_e, col_f = st.columns(2)
+                    new_model = col_e.selectbox("Battery Model",
+                                                ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+                    purchase_date = col_f.date_input("Date of Purchase", value=datetime.now())
+
+                    notes = st.text_area("Technician Notes", "Warranty replacement issued.")
                     final_submit = st.form_submit_button("Complete Exchange")
 
                     if final_submit:
-                        if not new_serial:
-                            st.error("Scan new serial.")
+                        if not new_serial or not ticket_id:
+                            st.error("Serial and Ticket ID are mandatory.")
                         else:
                             conn = get_db_connection()
                             c = conn.cursor()
                             try:
+                                p_date_str = purchase_date.strftime("%Y-%m-%d")
                                 c.execute("INSERT OR REPLACE INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
                                           (st.session_state.temp_phone, cust_name, datetime.now().strftime("%Y-%m-%d")))
-                                c.execute(
-                                    "UPDATE batteries SET status='returned_faulty', current_owner_phone=NULL WHERE serial_no=?",
-                                    (st.session_state.temp_old_serial,))
-                                expiry_date = (datetime.now() + timedelta(days=30 * warranty_months)).strftime(
-                                    "%Y-%m-%d")
-                                c.execute(
-                                    "INSERT OR REPLACE INTO batteries (serial_no, model_type, status, sold_date, warranty_expiry, current_owner_phone) VALUES (?, ?, 'sold', ?, ?, ?)",
-                                    (new_serial, new_model, datetime.now().strftime("%Y-%m-%d"), expiry_date,
-                                     st.session_state.temp_phone))
+                                c.execute("UPDATE batteries SET status='returned_faulty' WHERE serial_no=?",
+                                          (st.session_state.temp_old_serial,))
+                                c.execute('''INSERT OR REPLACE INTO batteries 
+                                             (serial_no, model_type, status, sold_date, date_of_purchase, current_owner_phone, ticket_id, vehicle_no) 
+                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                          (new_serial, new_model, 'sold', datetime.now().strftime("%Y-%m-%d"),
+                                           p_date_str, st.session_state.temp_phone, ticket_id, vehicle_no))
+
                                 c.execute(
                                     "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
                                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), st.session_state.temp_old_serial,
-                                     new_serial, st.session_state.temp_phone, "NEW_REPLACEMENT_ISSUED", notes))
+                                     new_serial, st.session_state.temp_phone, "NEW_REPLACEMENT_ISSUED",
+                                     f"Ticket: {ticket_id}. {notes}"))
                                 conn.commit()
-                                st.success(f"Replacement Success! New Battery {new_serial} issued.")
-                                st.session_state.otp_verified = False
-                                st.session_state.current_otp = None
+
+                                # Save summary for printing
+                                st.session_state.last_exchange_summary = {
+                                    'cust_name': cust_name,
+                                    'vehicle_no': vehicle_no,
+                                    'new_serial': new_serial,
+                                    'old_serial': st.session_state.temp_old_serial,
+                                    'ticket_id': ticket_id,
+                                    'new_model': new_model,
+                                    'purchase_date': p_date_str,
+                                    'notes': notes
+                                }
+                                st.session_state.exchange_complete = True
+                                st.rerun()
                             finally:
                                 conn.close()
 
             else:
                 with st.form("repair_later"):
-                    cust_name = st.text_input("Customer Name")
-                    notes = st.text_area("Initial Observation", "Customer reports issue. Keeping for service.")
+                    col_x, col_y = st.columns(2)
+                    cust_name = col_x.text_input("Customer Name")
+                    ticket_id = col_y.text_input("Exide Ticket ID (If generated)")
+
+                    col_z1, col_z2 = st.columns(2)
+                    vehicle_no = col_z1.text_input("Vehicle Registration No.")
+                    purchase_date = col_z2.date_input("Date of Purchase", value=datetime.now())
+
+                    notes = st.text_area("Initial Observation", "Keeping for service/charging.")
                     repair_submit = st.form_submit_button("Log Entry - Battery Kept for Service")
+
                     if repair_submit:
                         conn = get_db_connection()
                         c = conn.cursor()
@@ -318,13 +426,20 @@ def page_service():
                             c.execute("INSERT OR REPLACE INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
                                       (st.session_state.temp_phone, cust_name, datetime.now().strftime("%Y-%m-%d")))
                             c.execute(
-                                "INSERT OR REPLACE INTO batteries (serial_no, status, current_owner_phone) VALUES (?, ?, ?)",
-                                (st.session_state.temp_old_serial, 'pending', st.session_state.temp_phone))
+                                "UPDATE batteries SET status='pending', current_owner_phone=?, ticket_id=?, vehicle_no=?, date_of_purchase=? WHERE serial_no=?",
+                                (st.session_state.temp_phone, ticket_id, vehicle_no, purchase_date.strftime("%Y-%m-%d"),
+                                 st.session_state.temp_old_serial))
+
+                            c.execute(
+                                "INSERT OR IGNORE INTO batteries (serial_no, status, current_owner_phone, ticket_id, vehicle_no, date_of_purchase) VALUES (?, ?, ?, ?, ?, ?)",
+                                (st.session_state.temp_old_serial, 'pending', st.session_state.temp_phone, ticket_id,
+                                 vehicle_no, purchase_date.strftime("%Y-%m-%d")))
+
                             c.execute(
                                 "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
                                 (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), st.session_state.temp_old_serial,
                                  st.session_state.temp_old_serial, st.session_state.temp_phone, "SERVICE_PENDING",
-                                 notes))
+                                 f"Ticket: {ticket_id}. {notes}"))
                             conn.commit()
                             st.info(f"Battery {st.session_state.temp_old_serial} is now marked as 'PENDING'.")
                             st.session_state.otp_verified = False
@@ -339,7 +454,7 @@ def page_service():
         if search_phone:
             conn = get_db_connection()
             ready_items = pd.read_sql(f"""
-                SELECT serial_no, model_type, status 
+                SELECT serial_no, model_type, status, ticket_id, vehicle_no, date_of_purchase
                 FROM batteries 
                 WHERE current_owner_phone='{search_phone}' 
                 AND status IN ('ready_for_pickup', 'pending')
@@ -347,8 +462,10 @@ def page_service():
             conn.close()
 
             if not ready_items.empty:
-                st.write("The following items are in service for this customer:")
-                st.dataframe(ready_items)
+                st.write("Items in service:")
+                ready_items['Age'] = ready_items['date_of_purchase'].apply(calculate_age)
+                st.dataframe(ready_items[['serial_no', 'status', 'ticket_id', 'vehicle_no', 'Age']])
+
                 selected_serial = st.selectbox("Select Battery to Return", ready_items['serial_no'].tolist())
 
                 if st.button("Verify Customer & Send OTP for Pickup", key="pickup_send_otp"):
@@ -357,19 +474,19 @@ def page_service():
                     st.session_state.temp_phone = search_phone
                     st.session_state.temp_pickup_serial = selected_serial
                     st.session_state.workflow = "PICKUP"
+                    st.session_state.pickup_verified = False
                     send_otp_simulation(search_phone, otp)
 
                 if st.session_state.current_otp and st.session_state.get('workflow') == "PICKUP":
-                    otp_pickup = st.text_input("Enter OTP for Pickup", key="otp_input_pickup")
-                    if st.button("Confirm Return to Customer", key="confirm_pickup_btn"):
-                        if otp_pickup == st.session_state.current_otp:
+                    st.text_input("Enter OTP for Pickup", key="pickup_otp_input")
+                    if st.button("Confirm Return to Customer", key="confirm_pickup_btn", on_click=verify_pickup_otp):
+                        if st.session_state.get('pickup_verified'):
                             if process_pickup_db(st.session_state.temp_pickup_serial, search_phone):
                                 st.success(f"Battery {st.session_state.temp_pickup_serial} returned successfully!")
                                 st.session_state.current_otp = None
                                 st.session_state.workflow = None
+                                st.session_state.pickup_verified = False
                                 st.rerun()
-                        else:
-                            st.error("Invalid OTP.")
             else:
                 st.warning("No items found in service for this phone number.")
 
@@ -386,16 +503,11 @@ def page_history():
             if not batt.empty:
                 row = batt.iloc[0]
                 st.subheader("Battery Details")
+                st.write(f"**Ticket ID:** {row['ticket_id'] or 'N/A'}")
+                st.write(f"**Vehicle No:** {row['vehicle_no'] or 'N/A'}")
+                st.write(f"**Age since Purchase:** {calculate_age(row['date_of_purchase'])}")
                 st.dataframe(batt)
-                if row['status'] in ['pending', 'ready_for_pickup']:
-                    st.info(f"Current Status: {row['status'].upper()}. You can process pickup here.")
-                    if st.button(f"Generate OTP for Serial {row['serial_no']}"):
-                        otp = generate_otp()
-                        st.session_state.current_otp = otp
-                        st.session_state.temp_phone = row['current_owner_phone']
-                        st.session_state.temp_pickup_serial = row['serial_no']
-                        st.session_state.workflow = "HISTORY_PICKUP"
-                        send_otp_simulation(row['current_owner_phone'], otp)
+
                 st.subheader("Service History")
                 trans = pd.read_sql(f'''SELECT * FROM exchanges 
                                         WHERE old_battery_serial='{query}' 
@@ -407,37 +519,17 @@ def page_history():
             cust = pd.read_sql(f"SELECT * FROM customers WHERE phone='{query}'", conn)
             if not cust.empty:
                 st.write(f"**Customer Name:** {cust.iloc[0]['name']}")
-                st.subheader("Batteries Currently Owned")
+                st.subheader("Batteries Owned")
                 owned = pd.read_sql(f"SELECT * FROM batteries WHERE current_owner_phone='{query}'", conn)
-                st.dataframe(owned)
-                in_shop = owned[owned['status'].isin(['pending', 'ready_for_pickup'])]
-                if not in_shop.empty:
-                    st.subheader("Process Pickup")
-                    pick_serial = st.selectbox("Select Item in Shop", in_shop['serial_no'].tolist())
-                    if st.button(f"Send Pickup OTP to {query}"):
-                        otp = generate_otp()
-                        st.session_state.current_otp = otp
-                        st.session_state.temp_phone = query
-                        st.session_state.temp_pickup_serial = pick_serial
-                        st.session_state.workflow = "HISTORY_PICKUP"
-                        send_otp_simulation(query, otp)
+                if not owned.empty:
+                    owned['Age'] = owned['date_of_purchase'].apply(calculate_age)
+                    st.dataframe(owned[['serial_no', 'model_type', 'status', 'ticket_id', 'vehicle_no', 'Age']])
+
                 st.subheader("Exchange Logs")
                 history = pd.read_sql(f"SELECT * FROM exchanges WHERE customer_phone='{query}'", conn)
                 st.dataframe(history)
             else:
                 st.warning("Customer not found.")
-
-        if st.session_state.get('current_otp') and st.session_state.get('workflow') == "HISTORY_PICKUP":
-            h_otp = st.text_input("Enter OTP to Confirm Customer Pickup", key="history_otp_input")
-            if st.button("Finalize Customer Pickup"):
-                if h_otp == st.session_state.current_otp:
-                    if process_pickup_db(st.session_state.temp_pickup_serial, st.session_state.temp_phone):
-                        st.success("Battery marked as 'Picked up by Customer'.")
-                        st.session_state.current_otp = None
-                        st.session_state.workflow = None
-                        st.rerun()
-                else:
-                    st.error("Incorrect OTP.")
         conn.close()
 
 
@@ -446,15 +538,17 @@ def page_inventory():
     with st.form("add_stock"):
         serial = st.text_input("Serial Number")
         model = st.selectbox("Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+        p_date = st.date_input("Date of Purchase (If pre-owned/return)", value=datetime.now())
+
         submit = st.form_submit_button("Add to Stock")
         if submit and serial:
             conn = get_db_connection()
             try:
                 c = conn.cursor()
-                c.execute('''INSERT INTO batteries (serial_no, model_type, status)
-                             VALUES (?, ?, 'in_stock')''', (serial, model))
+                c.execute('''INSERT INTO batteries (serial_no, model_type, status, date_of_purchase)
+                             VALUES (?, ?, 'in_stock', ?)''', (serial, model, p_date.strftime("%Y-%m-%d")))
                 conn.commit()
-                st.success(f"Battery {serial} added to stock.")
+                st.success(f"Battery {serial} added. Age: {calculate_age(p_date.strftime('%Y-%m-%d'))}")
             except sqlite3.IntegrityError:
                 st.error("Battery with this serial number already exists.")
             finally:
@@ -465,7 +559,6 @@ def main():
     """Main function to run the Streamlit app."""
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
     init_db()
-    cleanup_expired_data()
     st.sidebar.title(SHOP_NAME)
     menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Add Inventory"])
     if menu == "Dashboard":
@@ -476,7 +569,6 @@ def main():
         page_history()
     elif menu == "Add Inventory":
         page_inventory()
-
 
 if __name__ == "__main__":
     main()
