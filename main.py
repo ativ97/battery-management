@@ -562,8 +562,8 @@ def main():
         page_service()
     elif menu == "Search History":
         page_history()
-    elif menu == "Add Inventory":
-        page_inventory()
+    #elif menu == "Add Inventory":
+     #   page_inventory()
 
 if __name__ == "__main__":
     main()
