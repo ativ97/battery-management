@@ -144,6 +144,20 @@ def verify_pickup_otp():
     else:
         st.error("Invalid OTP.")
 
+def process_pickup_db(serial, phone):
+    """Mark battery as returned to customer."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("UPDATE batteries SET status='active_with_customer' WHERE serial_no=?", (serial,))
+        c.execute("INSERT INTO exchanges (date, old_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?)",
+                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), serial, phone, "RETURNED_TO_CUSTOMER", "Service completed, battery returned."))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Database Error: {e}")
+        return False
 
 # --- PAGE COMPONENTS ---
 def page_dashboard():
@@ -530,6 +544,97 @@ def page_inventory():
                 conn.close()
 
 
+def page_stock_loan_exide():
+    st.title("🏭 Stock Loan Exide")
+    
+    # Form to add new entry
+    with st.form("add_stock_loan"):
+        st.subheader("New Stock Request / Loan")
+        serial = st.text_input("Serial Number")
+        model = st.selectbox("Battery Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+        req_date = st.date_input("Date", value=datetime.now())
+        
+        submit = st.form_submit_button("Add to Pending Stock")
+        
+        if submit:
+            if not serial:
+                st.error("Serial Number is required")
+            else:
+                conn = get_db_connection()
+                try:
+                    c = conn.cursor()
+                    # Check if exists
+                    c.execute("SELECT * FROM batteries WHERE serial_no=?", (serial,))
+                    if c.fetchone():
+                        st.error("Battery with this serial number already exists.")
+                    else:
+                        # Insert with status 'factory_pending'
+                        c.execute('''INSERT INTO batteries 
+                                     (serial_no, model_type, status, date_of_purchase) 
+                                     VALUES (?, ?, 'factory_pending', ?)''', 
+                                  (serial, model, req_date.strftime("%Y-%m-%d")))
+                        conn.commit()
+                        st.success(f"Added {serial} to pending list.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                finally:
+                    conn.close()
+
+    st.markdown("---")
+    st.subheader("⏳ Pending Stock from Exide Factory")
+    
+    conn = get_db_connection()
+    pending_stock = pd.read_sql("SELECT * FROM batteries WHERE status='factory_pending'", conn)
+    
+    if not pending_stock.empty:
+        for index, row in pending_stock.iterrows():
+            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+            with col1:
+                st.write(f"**SN:** {row['serial_no']}")
+            with col2:
+                st.write(f"**Model:** {row['model_type']}")
+            with col3:
+                st.write(f"**Date:** {row['date_of_purchase']}")
+            with col4:
+                if st.button("Mark Received", key=f"recv_{row['serial_no']}"):
+                    c = conn.cursor()
+                    c.execute("UPDATE batteries SET status='in_stock' WHERE serial_no=?", (row['serial_no'],))
+                    
+                    # Log to exchanges for audit
+                    c.execute('''INSERT INTO exchanges 
+                                 (date, old_battery_serial, customer_phone, action_taken, notes) 
+                                 VALUES (?, ?, ?, ?, ?)''',
+                              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                               row['serial_no'], 
+                               'EXIDE_FACTORY', 
+                               'STOCK_RECEIVED', 
+                               f"Received stock: {row['model_type']}"))
+                    
+                    conn.commit()
+                    st.success(f"Stock {row['serial_no']} received!")
+                    st.rerun()
+    else:
+        st.info("No pending stock from factory.")
+    
+    st.markdown("---")
+    st.subheader("📜 Received Stock History (Audit)")
+    
+    audit_log = pd.read_sql("""
+        SELECT date as 'Received Date', old_battery_serial as 'Serial No', notes as 'Details' 
+        FROM exchanges 
+        WHERE action_taken='STOCK_RECEIVED' 
+        ORDER BY id DESC
+    """, conn)
+    
+    if not audit_log.empty:
+        st.dataframe(audit_log, use_container_width=True)
+    else:
+        st.info("No stock receipt history found.")
+
+    conn.close()
+
+
 def main():
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
     init_db()
@@ -555,13 +660,15 @@ def main():
         st.session_state.authenticated = False
         st.rerun()
 
-    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History"])
+    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Stock Loan Exide"])
     if menu == "Dashboard":
         page_dashboard()
     elif menu == "Service":
         page_service()
     elif menu == "Search History":
         page_history()
+    elif menu == "Stock Loan Exide":
+        page_stock_loan_exide()
     #elif menu == "Add Inventory":
      #   page_inventory()
 
