@@ -8,16 +8,37 @@ import os
 
 # --- CONFIGURATION ---
 DB_FILE = "battery_shop.db"
+CRED_FILE = "credentials.txt"
 SHOP_NAME = "EXIDE CARE VIKAS 23"
+
+
+# --- AUTHENTICATION SYSTEM ---
+def init_credentials():
+    """Create default credentials if the file doesn't exist."""
+    if not os.path.exists(CRED_FILE):
+        with open(CRED_FILE, "w") as f:
+            f.write("admin,admin123")
+
+
+def check_login(username, password):
+    """Verify credentials against the txt file."""
+    if not os.path.exists(CRED_FILE):
+        init_credentials()
+
+    with open(CRED_FILE, "r") as f:
+        for line in f:
+            u, p = line.strip().split(",")
+            if u == username and p == password:
+                return True
+    return False
 
 
 # --- DATABASE MANAGEMENT ---
 def init_db():
-    """Initialize the SQLite database with necessary tables and columns."""
+    """Initialize the SQLite database with necessary tables."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
-    # Customer Table
     c.execute('''CREATE TABLE IF NOT EXISTS customers
                  (
                      phone
@@ -30,7 +51,6 @@ def init_db():
                      TEXT
                  )''')
 
-    # Updated Battery Table with Ticket ID, Vehicle No, and Purchase Date
     c.execute('''CREATE TABLE IF NOT EXISTS batteries
                  (
                      serial_no
@@ -55,7 +75,6 @@ def init_db():
                      TEXT
                  )''')
 
-    # Exchange/Service Logs
     c.execute('''CREATE TABLE IF NOT EXISTS exchanges
                  (
                      id
@@ -77,21 +96,6 @@ def init_db():
                      TEXT
                  )''')
 
-    # --- MIGRATION CHECK FOR NEW FIELDS ---
-    c.execute("PRAGMA table_info(batteries)")
-    columns = [column[1] for column in c.fetchall()]
-    new_fields = {
-        'ticket_id': 'TEXT',
-        'vehicle_no': 'TEXT',
-        'date_of_purchase': 'TEXT'
-    }
-    for field, ftype in new_fields.items():
-        if field not in columns:
-            try:
-                c.execute(f"ALTER TABLE batteries ADD COLUMN {field} {ftype}")
-            except Exception as e:
-                print(f"Migration notice: {e}")
-
     conn.commit()
     conn.close()
 
@@ -101,86 +105,59 @@ def get_db_connection():
 
 
 # --- HELPER FUNCTIONS ---
-
 def calculate_age(purchase_date_str):
-    """Calculates days and months since purchase."""
-    if not purchase_date_str:
-        return "N/A"
+    if not purchase_date_str: return "N/A"
     try:
         p_date = datetime.strptime(purchase_date_str, "%Y-%m-%d")
         today = datetime.now()
         diff = today - p_date
-
         days = diff.days
         months = days // 30
         remaining_days = days % 30
-
         return f"{days} days (~{months} months, {remaining_days} days)"
     except:
         return "Invalid Date"
 
 
 def generate_otp():
-    """Generates a 4-digit OTP."""
     return str(random.randint(1000, 9999))
 
 
 def send_otp_simulation(phone, otp):
-    """Simulates sending an OTP."""
     with st.spinner(f"Sending OTP to {phone}..."):
         time.sleep(1)
     st.toast(f"🔔 SMS SENT: Your OTP is {otp}", icon="📱")
     return True
 
 
-def process_pickup_db(serial, phone):
-    """Helper to finalize the return of a battery to a customer."""
-    conn = get_db_connection()
-    c = conn.cursor()
-    try:
-        c.execute("UPDATE batteries SET status='sold' WHERE serial_no=?", (serial,))
-        c.execute(
-            "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), serial, serial, phone, "RETURNED_TO_CUST",
-             "Service completed and returned to customer."))
-        conn.commit()
-        return True
-    except Exception as e:
-        st.error(f"Error during pickup: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-# --- CALLBACKS TO FIX BUTTON PRESS ISSUES ---
+# --- CALLBACKS ---
 def verify_claim_otp():
     if st.session_state.claim_otp_input == st.session_state.current_otp:
         st.session_state.otp_verified = True
     else:
-        st.error("Invalid OTP. Please try again.")
+        st.error("Invalid OTP.")
 
 
 def verify_pickup_otp():
     if st.session_state.pickup_otp_input == st.session_state.current_otp:
         st.session_state.pickup_verified = True
     else:
-        st.error("Invalid OTP. Please try again.")
+        st.error("Invalid OTP.")
 
 
-# --- UI PAGES ---
-
+# --- PAGE COMPONENTS ---
 def page_dashboard():
     st.title(f"🔋 {SHOP_NAME} Dashboard")
-
     conn = get_db_connection()
     col1, col2, col3 = st.columns(3)
 
     total_customers = pd.read_sql("SELECT count(*) as cnt FROM customers", conn).iloc[0]['cnt']
-    batteries_sold = pd.read_sql("SELECT count(*) as cnt FROM batteries WHERE status='sold'", conn).iloc[0]['cnt']
+    batteries_replaced = pd.read_sql("SELECT count(*) as cnt FROM batteries WHERE status='replaced'", conn).iloc[0][
+        'cnt']
     exchanges_done = pd.read_sql("SELECT count(*) as cnt FROM exchanges", conn).iloc[0]['cnt']
 
     col1.metric("Total Customers", total_customers)
-    col2.metric("Active Batteries (Sold)", batteries_sold)
+    col2.metric("Active Batteries (Replaced)", batteries_replaced)
     col3.metric("Total Services/Exchanges", exchanges_done)
 
     st.markdown("---")
@@ -298,8 +275,6 @@ def page_service():
 
             if st.button("Process Another Claim"):
                 st.session_state.exchange_complete = False
-                st.session_state.otp_verified = False
-                st.session_state.current_otp = None
                 st.rerun()
             return
 
@@ -556,10 +531,30 @@ def page_inventory():
 
 
 def main():
-    """Main function to run the Streamlit app."""
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
     init_db()
+    init_credentials()
+
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔐 Login")
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if check_login(user, pw):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Invalid credentials.")
+        return
+
     st.sidebar.title(SHOP_NAME)
+    if st.sidebar.button("Logout"):
+        st.session_state.authenticated = False
+        st.rerun()
+
     menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Add Inventory"])
     if menu == "Dashboard":
         page_dashboard()
