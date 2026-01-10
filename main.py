@@ -555,7 +555,7 @@ def main():
         st.session_state.authenticated = False
         st.rerun()
 
-    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Add Inventory"])
+    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History"])
     if menu == "Dashboard":
         page_dashboard()
     elif menu == "Service":
