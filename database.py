@@ -1,22 +1,29 @@
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from config import get_db_url
 import streamlit as st
 
 Base = declarative_base()
 
+@st.cache_resource
 def get_db_engine():
     db_url = get_db_url()
     if not db_url:
         st.error("Missing DB_URL in Streamlit Secrets!")
         st.stop()
-    return create_engine(db_url)
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20
+    )
 
 def get_session():
     engine = get_db_engine()
     Session = sessionmaker(bind=engine)
     return Session()
 
+@st.cache_resource
 def init_db():
     engine = get_db_engine()
     Base.metadata.create_all(engine)
