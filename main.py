@@ -1,5 +1,7 @@
 import streamlit as st
 from datetime import datetime
+import cv2
+import numpy as np
 from config import SHOP_NAME
 from auth import check_login
 from database import init_db
@@ -31,6 +33,25 @@ def verify_pickup_otp():
     else:
         st.error("Invalid OTP.")
 
+def decode_qr_image(image):
+    """Decodes QR code from an image using OpenCV."""
+    try:
+        # Convert the file to an opencv image.
+        file_bytes = np.asarray(bytearray(image.read()), dtype=np.uint8)
+        opencv_image = cv2.imdecode(file_bytes, 1)
+        
+        # Initialize the cv2 QRCode detector
+        detector = cv2.QRCodeDetector()
+        
+        # Detect and decode
+        data, bbox, _ = detector.detectAndDecode(opencv_image)
+        
+        if data:
+            return data
+        return None
+    except Exception as e:
+        st.error(f"Error decoding QR code: {e}")
+        return None
 
 # --- PAGE COMPONENTS ---
 def page_dashboard():
@@ -155,10 +176,35 @@ def page_service():
 
         st.subheader("1. Register Faulty Battery")
 
+        # Move camera logic OUTSIDE the form
+        col_cam, col_form = st.columns([1, 2])
+        
+        with col_cam:
+            st.write("📷 **Scan QR Code**")
+            img_file_buffer = None
+            if st.checkbox("Open Camera", key="cam_toggle_old_serial"):
+                img_file_buffer = st.camera_input("Scan QR Code for Serial", key="camera_old_serial", label_visibility="collapsed")
+            
+            if img_file_buffer is not None:
+                decoded_serial = decode_qr_image(img_file_buffer)
+                if decoded_serial:
+                    st.success(f"Scanned: {decoded_serial}")
+                    if 'scanned_old_serial' not in st.session_state or st.session_state.scanned_old_serial != decoded_serial:
+                        st.session_state.scanned_old_serial = decoded_serial
+                        st.rerun()
+
         with st.form("check_form"):
             col1, col2 = st.columns(2)
             phone = col1.text_input("Customer Phone Number", max_chars=10)
-            old_serial = col2.text_input("Faulty Battery Serial No.")
+            
+            # Use session state value if available
+            default_old_serial = ""
+            if 'scanned_old_serial' in st.session_state:
+                default_old_serial = st.session_state.scanned_old_serial
+                st.info(f"Using Scanned Serial: {default_old_serial}")
+
+            old_serial = col2.text_input("Faulty Battery Serial No.", value=default_old_serial, key="old_serial_input")
+            
             check_submit = st.form_submit_button("Verify Details & Send OTP")
 
         if check_submit:
@@ -183,6 +229,10 @@ def page_service():
                     st.session_state.otp_verified = False
                     send_otp_simulation(phone, otp)
                     st.info("OTP sent to customer's phone.")
+                    
+                    # Clear scanned state after successful submission
+                    if 'scanned_old_serial' in st.session_state:
+                        del st.session_state.scanned_old_serial
 
         if st.session_state.current_otp and not st.session_state.otp_verified and st.session_state.get(
                 'workflow') == "CLAIM":
@@ -201,7 +251,8 @@ def page_service():
                     vehicle_no = col_b.text_input("Vehicle Registration No.")
 
                     col_c, col_d = st.columns(2)
-                    new_serial = col_c.text_input("New Battery Serial Number")
+                    
+                    new_serial = col_c.text_input("New Battery Serial Number", key="new_serial_input")
                     ticket_id = col_d.text_input("Exide Ticket ID")
 
                     col_e, col_f = st.columns(2)
@@ -264,6 +315,20 @@ def page_service():
                             st.session_state.otp_verified = False
                         except Exception as e:
                             st.error(f"Error: {e}")
+            
+            # Add a separate expander for scanning new battery serial if needed
+            if action == "Issue New Replacement Battery":
+                 with st.expander("📷 Scan QR for New Battery Serial (Optional)"):
+                    img_file_buffer_new = None
+                    if st.checkbox("Enable Camera", key="cam_toggle_new_serial"):
+                        img_file_buffer_new = st.camera_input("Scan QR Code", key="camera_new_serial")
+                    
+                    if img_file_buffer_new is not None:
+                        decoded_new = decode_qr_image(img_file_buffer_new)
+                        if decoded_new:
+                            st.success(f"Scanned New Serial: {decoded_new}")
+                            st.info("Please copy and paste this into the 'New Battery Serial Number' field above.")
+                            st.code(decoded_new)
 
     with tab_pickup:
         st.subheader("Return Battery to Customer")
@@ -337,8 +402,24 @@ def page_history():
 
 def page_inventory():
     st.title("📦 Quick Inventory Add")
+    
+    # Add QR Scanner for Inventory
+    st.subheader("Scan QR Code (Optional)")
+    img_file_buffer = None
+    if st.checkbox("Open Camera Scanner", key="cam_toggle_inventory"):
+        img_file_buffer = st.camera_input("Scan QR for Serial", key="camera_inventory")
+        
+    scanned_serial = None
+    if img_file_buffer is not None:
+        scanned_serial = decode_qr_image(img_file_buffer)
+        if scanned_serial:
+            st.success(f"Scanned: {scanned_serial}")
+    
     with st.form("add_stock"):
-        serial = st.text_input("Serial Number")
+        # Use scanned serial if available, otherwise empty
+        default_serial = scanned_serial if scanned_serial else ""
+        serial = st.text_input("Serial Number", value=default_serial)
+        
         model = st.selectbox("Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
         p_date = st.date_input("Date of Purchase (If pre-owned/return)", value=datetime.now())
         submit = st.form_submit_button("Add to Stock")
@@ -352,9 +433,25 @@ def page_inventory():
 
 def page_stock_loan_exide():
     st.title("🏭 Stock Loan Exide")
+    
+    # Add QR Scanner for Stock Loan
+    st.subheader("Scan QR Code (Optional)")
+    img_file_buffer = None
+    if st.checkbox("Open Camera Scanner", key="cam_toggle_stock"):
+        img_file_buffer = st.camera_input("Scan QR for Serial", key="camera_stock_loan")
+        
+    scanned_serial = None
+    if img_file_buffer is not None:
+        scanned_serial = decode_qr_image(img_file_buffer)
+        if scanned_serial:
+            st.success(f"Scanned: {scanned_serial}")
+
     with st.form("add_stock_loan"):
         st.subheader("New Stock Request / Loan")
-        serial = st.text_input("Serial Number")
+        
+        default_serial = scanned_serial if scanned_serial else ""
+        serial = st.text_input("Serial Number", value=default_serial)
+
         model = st.selectbox("Battery Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
         req_date = st.date_input("Date", value=datetime.now())
         submit = st.form_submit_button("Add to Pending Stock")
