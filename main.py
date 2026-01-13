@@ -1,107 +1,75 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
+from sqlalchemy import create_engine, text
 from datetime import datetime, timedelta
 import random
 import time
 import os
 
 # --- CONFIGURATION ---
-DB_FILE = "battery_shop.db"
-CRED_FILE = "credentials.txt"
+# The DB_URL should be added in Streamlit Cloud -> Settings -> Secrets
+# Format: DB_URL = "postgresql://user:password@host:port/dbname?sslmode=require"
+DB_URL = st.secrets.get("DB_URL")
 SHOP_NAME = "EXIDE CARE VIKAS 23"
 
 
 # --- AUTHENTICATION SYSTEM ---
-def init_credentials():
-    """Create default credentials if the file doesn't exist."""
-    if not os.path.exists(CRED_FILE):
-        with open(CRED_FILE, "w") as f:
-            f.write("admin,admin123")
-
-
 def check_login(username, password):
-    """Verify credentials against the txt file."""
-    if not os.path.exists(CRED_FILE):
-        init_credentials()
-
-    with open(CRED_FILE, "r") as f:
-        for line in f:
-            u, p = line.strip().split(",")
-            if u == username and p == password:
-                return True
-    return False
+    """Verify credentials against Streamlit Secrets to ensure persistence."""
+    # We use st.secrets here because credentials.txt would also reset on deployment.
+    # Set these in Streamlit Cloud: ADMIN_USER="admin", ADMIN_PASSWORD="yourpassword"
+    admin_user = st.secrets.get("ADMIN_USER", "admin")
+    admin_pw = st.secrets.get("ADMIN_PASSWORD", "exide23")
+    return username == admin_user and password == admin_pw
 
 
 # --- DATABASE MANAGEMENT ---
+def get_db_engine():
+    """Create a SQLAlchemy engine for PostgreSQL."""
+    if not DB_URL:
+        st.error("Missing DB_URL in Streamlit Secrets!")
+        st.stop()
+    return create_engine(DB_URL)
+
+
 def init_db():
-    """Initialize the SQLite database with necessary tables."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    """Initialize the PostgreSQL database with necessary tables."""
+    engine = get_db_engine()
+    with engine.begin() as conn:
+        # Customer Table
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS customers
+                     (
+                         phone TEXT PRIMARY KEY,
+                         name TEXT,
+                         created_at TEXT
+                     )'''))
 
-    c.execute('''CREATE TABLE IF NOT EXISTS customers
-                 (
-                     phone
-                     TEXT
-                     PRIMARY
-                     KEY,
-                     name
-                     TEXT,
-                     created_at
-                     TEXT
-                 )''')
+        # Battery Table
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS batteries
+                     (
+                         serial_no TEXT PRIMARY KEY,
+                         model_type TEXT,
+                         status TEXT,
+                         sold_date TEXT,
+                         date_of_purchase TEXT,
+                         warranty_expiry TEXT,
+                         current_owner_phone TEXT,
+                         ticket_id TEXT,
+                         vehicle_no TEXT
+                     )'''))
 
-    c.execute('''CREATE TABLE IF NOT EXISTS batteries
-                 (
-                     serial_no
-                     TEXT
-                     PRIMARY
-                     KEY,
-                     model_type
-                     TEXT,
-                     status
-                     TEXT,
-                     sold_date
-                     TEXT,
-                     date_of_purchase
-                     TEXT,
-                     warranty_expiry
-                     TEXT,
-                     current_owner_phone
-                     TEXT,
-                     ticket_id
-                     TEXT,
-                     vehicle_no
-                     TEXT
-                 )''')
-
-    c.execute('''CREATE TABLE IF NOT EXISTS exchanges
-                 (
-                     id
-                     INTEGER
-                     PRIMARY
-                     KEY
-                     AUTOINCREMENT,
-                     date
-                     TEXT,
-                     old_battery_serial
-                     TEXT,
-                     new_battery_serial
-                     TEXT,
-                     customer_phone
-                     TEXT,
-                     action_taken
-                     TEXT,
-                     notes
-                     TEXT
-                 )''')
-
-    conn.commit()
-    conn.close()
-
-
-def get_db_connection():
-    return sqlite3.connect(DB_FILE)
+        # Exchange/Service Logs
+        # Note: Postgres uses SERIAL for autoincrement
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS exchanges
+                     (
+                         id SERIAL PRIMARY KEY,
+                         date TEXT,
+                         old_battery_serial TEXT,
+                         new_battery_serial TEXT,
+                         customer_phone TEXT,
+                         action_taken TEXT,
+                         notes TEXT
+                     )'''))
 
 
 # --- HELPER FUNCTIONS ---
@@ -144,31 +112,41 @@ def verify_pickup_otp():
     else:
         st.error("Invalid OTP.")
 
+
 def process_pickup_db(serial, phone):
     """Mark battery as returned to customer."""
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("UPDATE batteries SET status='active_with_customer' WHERE serial_no=?", (serial,))
-        c.execute("INSERT INTO exchanges (date, old_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?)",
-                  (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), serial, phone, "RETURNED_TO_CUSTOMER", "Service completed, battery returned."))
-        conn.commit()
-        conn.close()
+        engine = get_db_engine()
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE batteries SET status='active_with_customer' WHERE serial_no=:serial"),
+                         {"serial": serial})
+            conn.execute(text("""
+                INSERT INTO exchanges (date, old_battery_serial, customer_phone, action_taken, notes) 
+                VALUES (:date, :serial, :phone, :action, :notes)
+            """), {
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "serial": serial,
+                "phone": phone,
+                "action": "RETURNED_TO_CUSTOMER",
+                "notes": "Service completed, battery returned."
+            })
         return True
     except Exception as e:
         st.error(f"Database Error: {e}")
         return False
 
+
 # --- PAGE COMPONENTS ---
 def page_dashboard():
     st.title(f"🔋 {SHOP_NAME} Dashboard")
-    conn = get_db_connection()
+    engine = get_db_engine()
     col1, col2, col3 = st.columns(3)
 
-    total_customers = pd.read_sql("SELECT count(*) as cnt FROM customers", conn).iloc[0]['cnt']
-    batteries_replaced = pd.read_sql("SELECT count(*) as cnt FROM batteries WHERE status='replaced'", conn).iloc[0][
-        'cnt']
-    exchanges_done = pd.read_sql("SELECT count(*) as cnt FROM exchanges", conn).iloc[0]['cnt']
+    with engine.connect() as conn:
+        total_customers = pd.read_sql(text("SELECT count(*) as cnt FROM customers"), conn).iloc[0]['cnt']
+        batteries_replaced = \
+        pd.read_sql(text("SELECT count(*) as cnt FROM batteries WHERE status='replaced'"), conn).iloc[0]['cnt']
+        exchanges_done = pd.read_sql(text("SELECT count(*) as cnt FROM exchanges"), conn).iloc[0]['cnt']
 
     col1.metric("Total Customers", total_customers)
     col2.metric("Active Batteries (Replaced)", batteries_replaced)
@@ -176,11 +154,12 @@ def page_dashboard():
 
     st.markdown("---")
     st.subheader("🛠️ Active Service Management")
-    in_service = pd.read_sql("""
-                             SELECT serial_no, current_owner_phone, status, date_of_purchase, ticket_id, vehicle_no
-                             FROM batteries
-                             WHERE status IN ('pending', 'ready_for_pickup')
-                             """, conn)
+    with engine.connect() as conn:
+        in_service = pd.read_sql(text("""
+                                 SELECT serial_no, current_owner_phone, status, date_of_purchase, ticket_id, vehicle_no
+                                 FROM batteries
+                                 WHERE status IN ('pending', 'ready_for_pickup')
+                                 """), conn)
 
     if not in_service.empty:
         for index, row in in_service.iterrows():
@@ -200,9 +179,9 @@ def page_dashboard():
 
                 if new_status != row['status']:
                     if st.button(f"Save Status for {row['serial_no']}", key=f"btn_{row['serial_no']}"):
-                        c = conn.cursor()
-                        c.execute("UPDATE batteries SET status=? WHERE serial_no=?", (new_status, row['serial_no']))
-                        conn.commit()
+                        with engine.begin() as conn:
+                            conn.execute(text("UPDATE batteries SET status=:status WHERE serial_no=:serial"),
+                                         {"status": new_status, "serial": row['serial_no']})
                         st.success(f"Status updated to {new_status}!")
                         st.rerun()
     else:
@@ -210,9 +189,9 @@ def page_dashboard():
 
     st.markdown("---")
     st.subheader("Recent Service History")
-    recent = pd.read_sql("SELECT * FROM exchanges ORDER BY id DESC LIMIT 5", conn)
+    with engine.connect() as conn:
+        recent = pd.read_sql(text("SELECT * FROM exchanges ORDER BY id DESC LIMIT 5"), conn)
     st.dataframe(recent, use_container_width=True)
-    conn.close()
 
 
 def page_service():
@@ -271,7 +250,6 @@ def page_service():
             col_p1, col_p2 = st.columns(2)
             with col_p1:
                 if st.button("🖨️ Print Receipt"):
-                    # Print trigger with refined styling
                     st.components.v1.html(f"""
                         <script>
                             var printWin = window.open('', '', 'width=800,height=900');
@@ -304,8 +282,10 @@ def page_service():
             if len(phone) < 10 or not old_serial:
                 st.error("Please enter valid Phone and Serial Number.")
             else:
-                conn = get_db_connection()
-                batt = pd.read_sql(f"SELECT * FROM batteries WHERE serial_no='{old_serial}'", conn)
+                engine = get_db_engine()
+                with engine.connect() as conn:
+                    batt = pd.read_sql(text("SELECT * FROM batteries WHERE serial_no=:serial"),
+                                       conn, params={"serial": old_serial})
 
                 valid_warranty = True
                 if not batt.empty:
@@ -323,12 +303,10 @@ def page_service():
                     st.session_state.otp_verified = False
                     send_otp_simulation(phone, otp)
                     st.info("OTP sent to customer's phone.")
-                conn.close()
 
         if st.session_state.current_otp and not st.session_state.otp_verified and st.session_state.get(
                 'workflow') == "CLAIM":
             st.text_input("Enter OTP for Warranty Claim", key="claim_otp_input")
-            # Direct verification button with callback to ensure single-click state update
             st.button("Verify OTP", key="claim_verify_btn", on_click=verify_claim_otp)
 
         if st.session_state.otp_verified and st.session_state.get('workflow') == "CLAIM":
@@ -358,103 +336,122 @@ def page_service():
                         if not new_serial or not ticket_id:
                             st.error("Serial and Ticket ID are mandatory.")
                         else:
-                            conn = get_db_connection()
-                            c = conn.cursor()
+                            engine = get_db_engine()
                             try:
-                                p_date_str = purchase_date.strftime("%Y-%m-%d")
-                                c.execute("INSERT OR REPLACE INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
-                                          (st.session_state.temp_phone, cust_name, datetime.now().strftime("%Y-%m-%d")))
-                                c.execute("UPDATE batteries SET status='returned_faulty' WHERE serial_no=?",
-                                          (st.session_state.temp_old_serial,))
-                                c.execute('''INSERT OR REPLACE INTO batteries 
-                                             (serial_no, model_type, status, sold_date, date_of_purchase, current_owner_phone, ticket_id, vehicle_no) 
-                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                                          (new_serial, new_model, 'sold', datetime.now().strftime("%Y-%m-%d"),
-                                           p_date_str, st.session_state.temp_phone, ticket_id, vehicle_no))
+                                with engine.begin() as conn:
+                                    p_date_str = purchase_date.strftime("%Y-%m-%d")
+                                    # Postgres UPSERT for Customer
+                                    conn.execute(text("""
+                                        INSERT INTO customers (phone, name, created_at) VALUES (:phone, :name, :date)
+                                        ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
+                                    """), {"phone": st.session_state.temp_phone, "name": cust_name,
+                                           "date": datetime.now().strftime("%Y-%m-%d")})
 
-                                c.execute(
-                                    "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), st.session_state.temp_old_serial,
-                                     new_serial, st.session_state.temp_phone, "NEW_REPLACEMENT_ISSUED",
-                                     f"Ticket: {ticket_id}. {notes}"))
-                                conn.commit()
+                                    conn.execute(
+                                        text("UPDATE batteries SET status='returned_faulty' WHERE serial_no=:serial"),
+                                        {"serial": st.session_state.temp_old_serial})
 
-                                # Save summary for printing
+                                    # Postgres UPSERT for Battery
+                                    conn.execute(text("""
+                                        INSERT INTO batteries (serial_no, model_type, status, sold_date, date_of_purchase, current_owner_phone, ticket_id, vehicle_no)
+                                        VALUES (:serial, :model, 'sold', :sold_date, :p_date, :phone, :ticket, :vehicle)
+                                        ON CONFLICT (serial_no) DO UPDATE SET 
+                                            status = EXCLUDED.status, 
+                                            ticket_id = EXCLUDED.ticket_id, 
+                                            current_owner_phone = EXCLUDED.current_owner_phone,
+                                            vehicle_no = EXCLUDED.vehicle_no
+                                    """), {
+                                        "serial": new_serial, "model": new_model,
+                                        "sold_date": datetime.now().strftime("%Y-%m-%d"),
+                                        "p_date": p_date_str, "phone": st.session_state.temp_phone, "ticket": ticket_id,
+                                        "vehicle": vehicle_no
+                                    })
+
+                                    conn.execute(text("""
+                                        INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) 
+                                        VALUES (:date, :old, :new, :phone, 'NEW_REPLACEMENT_ISSUED', :notes)
+                                    """), {
+                                        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "old": st.session_state.temp_old_serial,
+                                        "new": new_serial, "phone": st.session_state.temp_phone,
+                                        "notes": f"Ticket: {ticket_id}. {notes}"
+                                    })
+
                                 st.session_state.last_exchange_summary = {
-                                    'cust_name': cust_name,
-                                    'vehicle_no': vehicle_no,
-                                    'new_serial': new_serial,
-                                    'old_serial': st.session_state.temp_old_serial,
-                                    'ticket_id': ticket_id,
-                                    'new_model': new_model,
-                                    'purchase_date': p_date_str,
-                                    'notes': notes
+                                    'cust_name': cust_name, 'vehicle_no': vehicle_no, 'new_serial': new_serial,
+                                    'old_serial': st.session_state.temp_old_serial, 'ticket_id': ticket_id,
+                                    'new_model': new_model, 'purchase_date': p_date_str, 'notes': notes
                                 }
                                 st.session_state.exchange_complete = True
                                 st.rerun()
-                            finally:
-                                conn.close()
-
+                            except Exception as e:
+                                st.error(f"Error: {e}")
             else:
                 with st.form("repair_later"):
                     col_x, col_y = st.columns(2)
                     cust_name = col_x.text_input("Customer Name")
                     ticket_id = col_y.text_input("Exide Ticket ID (If generated)")
-
                     col_z1, col_z2 = st.columns(2)
                     vehicle_no = col_z1.text_input("Vehicle Registration No.")
                     purchase_date = col_z2.date_input("Date of Purchase", value=datetime.now())
-
                     notes = st.text_area("Initial Observation", "Keeping for service/charging.")
                     repair_submit = st.form_submit_button("Log Entry - Battery Kept for Service")
 
                     if repair_submit:
-                        conn = get_db_connection()
-                        c = conn.cursor()
+                        engine = get_db_engine()
                         try:
-                            c.execute("INSERT OR REPLACE INTO customers (phone, name, created_at) VALUES (?, ?, ?)",
-                                      (st.session_state.temp_phone, cust_name, datetime.now().strftime("%Y-%m-%d")))
-                            c.execute(
-                                "UPDATE batteries SET status='pending', current_owner_phone=?, ticket_id=?, vehicle_no=?, date_of_purchase=? WHERE serial_no=?",
-                                (st.session_state.temp_phone, ticket_id, vehicle_no, purchase_date.strftime("%Y-%m-%d"),
-                                 st.session_state.temp_old_serial))
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO customers (phone, name, created_at) VALUES (:phone, :name, :date)
+                                    ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
+                                """), {"phone": st.session_state.temp_phone, "name": cust_name,
+                                       "date": datetime.now().strftime("%Y-%m-%d")})
 
-                            c.execute(
-                                "INSERT OR IGNORE INTO batteries (serial_no, status, current_owner_phone, ticket_id, vehicle_no, date_of_purchase) VALUES (?, ?, ?, ?, ?, ?)",
-                                (st.session_state.temp_old_serial, 'pending', st.session_state.temp_phone, ticket_id,
-                                 vehicle_no, purchase_date.strftime("%Y-%m-%d")))
+                                conn.execute(text("""
+                                    INSERT INTO batteries (serial_no, status, current_owner_phone, ticket_id, vehicle_no, date_of_purchase)
+                                    VALUES (:serial, 'pending', :phone, :ticket, :vehicle, :p_date)
+                                    ON CONFLICT (serial_no) DO UPDATE SET 
+                                        status = 'pending', 
+                                        current_owner_phone = EXCLUDED.current_owner_phone, 
+                                        ticket_id = EXCLUDED.ticket_id, 
+                                        vehicle_no = EXCLUDED.vehicle_no, 
+                                        date_of_purchase = EXCLUDED.date_of_purchase
+                                """), {
+                                    "serial": st.session_state.temp_old_serial, "phone": st.session_state.temp_phone,
+                                    "ticket": ticket_id, "vehicle": vehicle_no,
+                                    "p_date": purchase_date.strftime("%Y-%m-%d")
+                                })
 
-                            c.execute(
-                                "INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), st.session_state.temp_old_serial,
-                                 st.session_state.temp_old_serial, st.session_state.temp_phone, "SERVICE_PENDING",
-                                 f"Ticket: {ticket_id}. {notes}"))
-                            conn.commit()
+                                conn.execute(text("""
+                                    INSERT INTO exchanges (date, old_battery_serial, new_battery_serial, customer_phone, action_taken, notes) 
+                                    VALUES (:date, :old, :new, :phone, 'SERVICE_PENDING', :notes)
+                                """), {
+                                    "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "old": st.session_state.temp_old_serial,
+                                    "new": st.session_state.temp_old_serial, "phone": st.session_state.temp_phone,
+                                    "notes": f"Ticket: {ticket_id}. {notes}"
+                                })
                             st.info(f"Battery {st.session_state.temp_old_serial} is now marked as 'PENDING'.")
                             st.session_state.otp_verified = False
-                            st.session_state.current_otp = None
-                        finally:
-                            conn.close()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
 
     with tab_pickup:
         st.subheader("Return Battery to Customer")
         search_phone = st.text_input("Enter Customer Phone Number to Find Items", key="pickup_search_phone")
-
         if search_phone:
-            conn = get_db_connection()
-            ready_items = pd.read_sql(f"""
-                SELECT serial_no, model_type, status, ticket_id, vehicle_no, date_of_purchase
-                FROM batteries 
-                WHERE current_owner_phone='{search_phone}' 
-                AND status IN ('ready_for_pickup', 'pending')
-            """, conn)
-            conn.close()
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                ready_items = pd.read_sql(text("""
+                    SELECT serial_no, model_type, status, ticket_id, vehicle_no, date_of_purchase
+                    FROM batteries 
+                    WHERE current_owner_phone=:phone AND status IN ('ready_for_pickup', 'pending')
+                """), conn, params={"phone": search_phone})
 
             if not ready_items.empty:
                 st.write("Items in service:")
                 ready_items['Age'] = ready_items['date_of_purchase'].apply(calculate_age)
                 st.dataframe(ready_items[['serial_no', 'status', 'ticket_id', 'vehicle_no', 'Age']])
-
                 selected_serial = st.selectbox("Select Battery to Return", ready_items['serial_no'].tolist())
 
                 if st.button("Verify Customer & Send OTP for Pickup", key="pickup_send_otp"):
@@ -484,42 +481,41 @@ def page_history():
     st.title("🔎 Search History")
     search_type = st.radio("Search By:", ["Battery Serial Number", "Customer Phone"])
     query = st.text_input("Enter Search Term")
-
     if query:
-        conn = get_db_connection()
-        if search_type == "Battery Serial Number":
-            batt = pd.read_sql(f"SELECT * FROM batteries WHERE serial_no='{query}'", conn)
-            if not batt.empty:
-                row = batt.iloc[0]
-                st.subheader("Battery Details")
-                st.write(f"**Ticket ID:** {row['ticket_id'] or 'N/A'}")
-                st.write(f"**Vehicle No:** {row['vehicle_no'] or 'N/A'}")
-                st.write(f"**Age since Purchase:** {calculate_age(row['date_of_purchase'])}")
-                st.dataframe(batt)
-
-                st.subheader("Service History")
-                trans = pd.read_sql(f'''SELECT * FROM exchanges 
-                                        WHERE old_battery_serial='{query}' 
-                                        OR new_battery_serial='{query}' ''', conn)
-                st.dataframe(trans)
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            if search_type == "Battery Serial Number":
+                batt = pd.read_sql(text("SELECT * FROM batteries WHERE serial_no=:q"), conn, params={"q": query})
+                if not batt.empty:
+                    row = batt.iloc[0]
+                    st.subheader("Battery Details")
+                    st.write(f"**Ticket ID:** {row['ticket_id'] or 'N/A'}")
+                    st.write(f"**Vehicle No:** {row['vehicle_no'] or 'N/A'}")
+                    st.write(f"**Age since Purchase:** {calculate_age(row['date_of_purchase'])}")
+                    st.dataframe(batt)
+                    st.subheader("Service History")
+                    trans = pd.read_sql(text("""SELECT * FROM exchanges 
+                                            WHERE old_battery_serial=:q 
+                                            OR new_battery_serial=:q """), conn, params={"q": query})
+                    st.dataframe(trans)
+                else:
+                    st.warning("No battery found.")
             else:
-                st.warning("No battery found.")
-        else:
-            cust = pd.read_sql(f"SELECT * FROM customers WHERE phone='{query}'", conn)
-            if not cust.empty:
-                st.write(f"**Customer Name:** {cust.iloc[0]['name']}")
-                st.subheader("Batteries Owned")
-                owned = pd.read_sql(f"SELECT * FROM batteries WHERE current_owner_phone='{query}'", conn)
-                if not owned.empty:
-                    owned['Age'] = owned['date_of_purchase'].apply(calculate_age)
-                    st.dataframe(owned[['serial_no', 'model_type', 'status', 'ticket_id', 'vehicle_no', 'Age']])
-
-                st.subheader("Exchange Logs")
-                history = pd.read_sql(f"SELECT * FROM exchanges WHERE customer_phone='{query}'", conn)
-                st.dataframe(history)
-            else:
-                st.warning("Customer not found.")
-        conn.close()
+                cust = pd.read_sql(text("SELECT * FROM customers WHERE phone=:q"), conn, params={"q": query})
+                if not cust.empty:
+                    st.write(f"**Customer Name:** {cust.iloc[0]['name']}")
+                    st.subheader("Batteries Owned")
+                    owned = pd.read_sql(text("SELECT * FROM batteries WHERE current_owner_phone=:q"), conn,
+                                        params={"q": query})
+                    if not owned.empty:
+                        owned['Age'] = owned['date_of_purchase'].apply(calculate_age)
+                        st.dataframe(owned[['serial_no', 'model_type', 'status', 'ticket_id', 'vehicle_no', 'Age']])
+                    st.subheader("Exchange Logs")
+                    history = pd.read_sql(text("SELECT * FROM exchanges WHERE customer_phone=:q"), conn,
+                                          params={"q": query})
+                    st.dataframe(history)
+                else:
+                    st.warning("Customer not found.")
 
 
 def page_inventory():
@@ -528,65 +524,50 @@ def page_inventory():
         serial = st.text_input("Serial Number")
         model = st.selectbox("Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
         p_date = st.date_input("Date of Purchase (If pre-owned/return)", value=datetime.now())
-
         submit = st.form_submit_button("Add to Stock")
         if submit and serial:
-            conn = get_db_connection()
+            engine = get_db_engine()
             try:
-                c = conn.cursor()
-                c.execute('''INSERT INTO batteries (serial_no, model_type, status, date_of_purchase)
-                             VALUES (?, ?, 'in_stock', ?)''', (serial, model, p_date.strftime("%Y-%m-%d")))
-                conn.commit()
+                with engine.begin() as conn:
+                    conn.execute(text('''INSERT INTO batteries (serial_no, model_type, status, date_of_purchase)
+                                 VALUES (:s, :m, 'in_stock', :d)'''),
+                                 {"s": serial, "m": model, "d": p_date.strftime("%Y-%m-%d")})
                 st.success(f"Battery {serial} added. Age: {calculate_age(p_date.strftime('%Y-%m-%d'))}")
-            except sqlite3.IntegrityError:
-                st.error("Battery with this serial number already exists.")
-            finally:
-                conn.close()
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 
 def page_stock_loan_exide():
     st.title("🏭 Stock Loan Exide")
-    
-    # Form to add new entry
     with st.form("add_stock_loan"):
         st.subheader("New Stock Request / Loan")
         serial = st.text_input("Serial Number")
         model = st.selectbox("Battery Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
         req_date = st.date_input("Date", value=datetime.now())
-        
         submit = st.form_submit_button("Add to Pending Stock")
-        
         if submit:
             if not serial:
                 st.error("Serial Number is required")
             else:
-                conn = get_db_connection()
+                engine = get_db_engine()
                 try:
-                    c = conn.cursor()
-                    # Check if exists
-                    c.execute("SELECT * FROM batteries WHERE serial_no=?", (serial,))
-                    if c.fetchone():
-                        st.error("Battery with this serial number already exists.")
-                    else:
-                        # Insert with status 'factory_pending'
-                        c.execute('''INSERT INTO batteries 
-                                     (serial_no, model_type, status, date_of_purchase) 
-                                     VALUES (?, ?, 'factory_pending', ?)''', 
-                                  (serial, model, req_date.strftime("%Y-%m-%d")))
-                        conn.commit()
-                        st.success(f"Added {serial} to pending list.")
-                        st.rerun()
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            INSERT INTO batteries (serial_no, model_type, status, date_of_purchase) 
+                            VALUES (:s, :m, 'factory_pending', :d)
+                            ON CONFLICT (serial_no) DO UPDATE SET status = 'factory_pending'
+                        """), {"s": serial, "m": model, "d": req_date.strftime("%Y-%m-%d")})
+                    st.success(f"Added {serial} to pending list.")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
-                finally:
-                    conn.close()
 
     st.markdown("---")
     st.subheader("⏳ Pending Stock from Exide Factory")
-    
-    conn = get_db_connection()
-    pending_stock = pd.read_sql("SELECT * FROM batteries WHERE status='factory_pending'", conn)
-    
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        pending_stock = pd.read_sql(text("SELECT * FROM batteries WHERE status='factory_pending'"), conn)
+
     if not pending_stock.empty:
         for index, row in pending_stock.iterrows():
             col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
@@ -598,47 +579,36 @@ def page_stock_loan_exide():
                 st.write(f"**Date:** {row['date_of_purchase']}")
             with col4:
                 if st.button("Mark Received", key=f"recv_{row['serial_no']}"):
-                    c = conn.cursor()
-                    c.execute("UPDATE batteries SET status='in_stock' WHERE serial_no=?", (row['serial_no'],))
-                    
-                    # Log to exchanges for audit
-                    c.execute('''INSERT INTO exchanges 
-                                 (date, old_battery_serial, customer_phone, action_taken, notes) 
-                                 VALUES (?, ?, ?, ?, ?)''',
-                              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-                               row['serial_no'], 
-                               'EXIDE_FACTORY', 
-                               'STOCK_RECEIVED', 
-                               f"Received stock: {row['model_type']}"))
-                    
-                    conn.commit()
+                    with engine.begin() as conn:
+                        conn.execute(text("UPDATE batteries SET status='in_stock' WHERE serial_no=:s"),
+                                     {"s": row['serial_no']})
+                        conn.execute(text('''INSERT INTO exchanges (date, old_battery_serial, customer_phone, action_taken, notes) 
+                                     VALUES (:d, :s, 'EXIDE_FACTORY', 'STOCK_RECEIVED', :n)'''),
+                                     {"d": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "s": row['serial_no'],
+                                      "n": f"Received stock: {row['model_type']}"})
                     st.success(f"Stock {row['serial_no']} received!")
                     st.rerun()
     else:
         st.info("No pending stock from factory.")
-    
+
     st.markdown("---")
     st.subheader("📜 Received Stock History (Audit)")
-    
-    audit_log = pd.read_sql("""
-        SELECT date as 'Received Date', old_battery_serial as 'Serial No', notes as 'Details' 
-        FROM exchanges 
-        WHERE action_taken='STOCK_RECEIVED' 
-        ORDER BY id DESC
-    """, conn)
-    
+    with engine.connect() as conn:
+        audit_log = pd.read_sql(text("""
+            SELECT date as "Received Date", old_battery_serial as "Serial No", notes as "Details" 
+            FROM exchanges 
+            WHERE action_taken='STOCK_RECEIVED' 
+            ORDER BY id DESC
+        """), conn)
     if not audit_log.empty:
         st.dataframe(audit_log, use_container_width=True)
     else:
         st.info("No stock receipt history found.")
 
-    conn.close()
-
 
 def main():
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
     init_db()
-    init_credentials()
 
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
@@ -671,6 +641,7 @@ def main():
         page_stock_loan_exide()
     #elif menu == "Add Inventory":
      #   page_inventory()
+
 
 if __name__ == "__main__":
     main()
