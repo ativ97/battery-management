@@ -10,27 +10,41 @@ This is a Streamlit-based web application designed to manage battery inventory, 
     *   **Customer Pickup**: Manage returns of serviced batteries to customers with OTP verification.
 *   **Search History**: Look up battery details and service history by Serial Number or Customer Phone.
 *   **Stock Loan Exide**: Track stock requested from the Exide factory and audit received stock.
-*   **Authentication**: Simple file-based login system.
+*   **Authentication**: Secure login system using Streamlit Secrets.
 
 ## Project Structure
 
-*   `main.py`: The main application file containing all the Streamlit UI logic, database interactions, and business logic.
-*   `reset_db.py`: A utility script to reset or initialize the SQLite database (`battery_shop.db`).
-*   `credentials.txt`: Stores the admin credentials (format: `username,password`).
-*   `battery_shop.db`: The SQLite database file storing customers, batteries, and exchange logs.
+The project follows a modular structure for better maintainability and separation of concerns:
+
+*   `main.py`: The entry point of the application. Handles the UI layout and page navigation.
+*   `models.py`: Defines the database schema using SQLAlchemy ORM (Customer, Battery, Exchange).
+*   `database.py`: Manages database connections and session creation.
+*   `services.py`: Contains the business logic and data access layer (CRUD operations).
+*   `auth.py`: Handles user authentication logic.
+*   `config.py`: Centralized configuration for constants and secrets retrieval.
+*   `reset_db.py`: A utility script to reset or initialize the database schema.
+*   `requirements.txt`: Lists the Python dependencies.
 
 ## How to Run Locally
 
 1.  **Prerequisites**: Ensure you have Python installed.
 2.  **Install Dependencies**:
     ```bash
-    pip install streamlit pandas
+    pip install -r requirements.txt
     ```
-3.  **Run the App**:
+3.  **Configuration**:
+    Create a `.streamlit/secrets.toml` file in the project root with the following content (replace with your actual DB URL):
+    ```toml
+    DB_URL = "postgresql://user:password@host:port/dbname"
+    ADMIN_USER = "admin"
+    ADMIN_PASSWORD = "yourpassword"
+    ```
+    *Note: For local testing with SQLite, you can use `sqlite:///battery_shop.db` as the DB_URL.*
+
+4.  **Run the App**:
     ```bash
     streamlit run main.py
     ```
-4.  **Login**: Use the default credentials found in `credentials.txt` (default: `admin`, `admin123`).
 
 ## Deploying Updates to Streamlit Cloud
 
@@ -47,7 +61,7 @@ This app is deployed on Streamlit Cloud. To update the live application, you nee
 2.  **Commit Changes**:
     Save your changes with a descriptive message.
     ```bash
-    git commit -m "Added stock loan feature and audit log"
+    git commit -m "Refactored codebase to use ORM and modular structure"
     ```
 
 3.  **Push to Remote**:
@@ -55,9 +69,8 @@ This app is deployed on Streamlit Cloud. To update the live application, you nee
     ```bash
     git push origin main
     ```
-    *(Note: Replace `main` with your branch name if different, e.g., `master`)*
 
 ### Troubleshooting Deployment
 
 *   If the app doesn't update immediately, check your Streamlit Cloud dashboard for build logs.
-*   Ensure `requirements.txt` (if present) includes all necessary libraries (`streamlit`, `pandas`). Since this project uses standard libraries like `sqlite3`, `random`, `time`, `os`, `datetime`, usually only `streamlit` and `pandas` need explicit installation in the environment.
+*   Ensure you have set up the `DB_URL`, `ADMIN_USER`, and `ADMIN_PASSWORD` in the Streamlit Cloud "Secrets" settings.
