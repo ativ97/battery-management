@@ -2,5 +2,3 @@ streamlit
 pandas
 sqlalchemy
 psycopg2-binary
-opencv-python-headless
-numpy

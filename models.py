@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Text
+from sqlalchemy import Column, String, Integer, Text, Boolean
 from database import Base
 
 class Customer(Base):
@@ -18,6 +18,8 @@ class Battery(Base):
     current_owner_phone = Column(Text)
     ticket_id = Column(Text)
     vehicle_no = Column(Text)
+    # Removed complex loaner tracking, kept simple flag on the battery being serviced
+    has_loaner = Column(Boolean, default=False)
 
 class Exchange(Base):
     __tablename__ = 'exchanges'
@@ -28,3 +30,33 @@ class Exchange(Base):
     customer_phone = Column(Text)
     action_taken = Column(Text)
     notes = Column(Text)
+
+class ScrapBattery(Base):
+    __tablename__ = 'scrap_batteries'
+    serial_no = Column(Text, primary_key=True)
+    model_type = Column(Text)
+    received_date = Column(Text)
+    customer_phone = Column(Text)
+    ticket_id = Column(Text)
+    notes = Column(Text)
+
+class ChallanBattery(Base):
+    __tablename__ = 'challan_batteries'
+    serial_no = Column(Text, primary_key=True)
+    model_type = Column(Text)
+    received_date = Column(Text)
+    customer_phone = Column(Text)
+    ticket_id = Column(Text)
+    notes = Column(Text)
+    challan_date = Column(Text)
+
+class ArchivedScrapBattery(Base):
+    __tablename__ = 'audit_scrap_batteries'
+    serial_no = Column(Text, primary_key=True)
+    model_type = Column(Text)
+    received_date = Column(Text)
+    customer_phone = Column(Text)
+    ticket_id = Column(Text)
+    notes = Column(Text)
+    challan_date = Column(Text)
+    final_archived_date = Column(Text)

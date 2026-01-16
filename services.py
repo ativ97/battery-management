@@ -4,7 +4,7 @@ import time
 import streamlit as st
 import pandas as pd
 from database import get_session
-from models import Customer, Battery, Exchange
+from models import Customer, Battery, Exchange, ScrapBattery, ChallanBattery, ArchivedScrapBattery
 
 def calculate_age(purchase_date_str):
     if not purchase_date_str: return "N/A"
@@ -57,7 +57,24 @@ def get_recent_exchanges_df(limit=5):
     session = get_session()
     try:
         query = session.query(Exchange).order_by(Exchange.id.desc()).limit(limit).statement
-        return pd.read_sql(query, session.bind)
+        df = pd.read_sql(query, session.bind)
+        
+        # Extract Ticket ID from notes if available
+        if 'notes' in df.columns:
+            df['Ticket ID'] = df['notes'].str.extract(r'Ticket: (.*?)\.')
+            
+        # Drop internal ID column
+        if 'id' in df.columns:
+            df = df.drop(columns=['id'])
+            
+        # Reorder columns to show Ticket ID prominently
+        desired_order = ['date', 'Ticket ID', 'action_taken', 'customer_phone', 'old_battery_serial', 'new_battery_serial', 'notes']
+        # Filter to only include columns that actually exist in the dataframe
+        existing_cols = [c for c in desired_order if c in df.columns]
+        # Add any other columns that were not in the desired list
+        remaining_cols = [c for c in df.columns if c not in existing_cols]
+        
+        return df[existing_cols + remaining_cols]
     finally:
         session.close()
 
@@ -118,7 +135,7 @@ def get_customer_exchanges_df(phone):
 def get_ready_for_pickup_items_df(phone):
     session = get_session()
     try:
-        query = session.query(Battery.serial_no, Battery.model_type, Battery.status, Battery.ticket_id, Battery.vehicle_no, Battery.date_of_purchase)\
+        query = session.query(Battery.serial_no, Battery.model_type, Battery.status, Battery.ticket_id, Battery.vehicle_no, Battery.date_of_purchase, Battery.has_loaner)\
             .filter(Battery.current_owner_phone == phone)\
             .filter(Battery.status.in_(['ready_for_pickup', 'pending']))\
             .statement
@@ -142,6 +159,79 @@ def get_stock_receipt_history_df():
             .order_by(Exchange.id.desc())\
             .statement
         return pd.read_sql(query, session.bind)
+    finally:
+        session.close()
+
+def get_scrap_batteries_df():
+    session = get_session()
+    try:
+        query = session.query(ScrapBattery).statement
+        return pd.read_sql(query, session.bind)
+    finally:
+        session.close()
+
+def get_challan_batteries_df():
+    session = get_session()
+    try:
+        query = session.query(ChallanBattery).order_by(ChallanBattery.challan_date.desc()).statement
+        return pd.read_sql(query, session.bind)
+    finally:
+        session.close()
+
+def move_scrap_to_challan(serial_numbers):
+    session = get_session()
+    try:
+        items = session.query(ScrapBattery).filter(ScrapBattery.serial_no.in_(serial_numbers)).all()
+        if not items:
+            return False
+        
+        for item in items:
+            challan_item = ChallanBattery(
+                serial_no=item.serial_no,
+                model_type=item.model_type,
+                received_date=item.received_date,
+                customer_phone=item.customer_phone,
+                ticket_id=item.ticket_id,
+                notes=item.notes,
+                challan_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+            session.add(challan_item)
+            session.delete(item)
+        
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+
+def clear_challan_to_archive():
+    session = get_session()
+    try:
+        items = session.query(ChallanBattery).all()
+        if not items:
+            return False
+            
+        for item in items:
+            archived = ArchivedScrapBattery(
+                serial_no=item.serial_no,
+                model_type=item.model_type,
+                received_date=item.received_date,
+                customer_phone=item.customer_phone,
+                ticket_id=item.ticket_id,
+                notes=item.notes,
+                challan_date=item.challan_date,
+                final_archived_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+            session.add(archived)
+            session.delete(item)
+            
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        raise e
     finally:
         session.close()
 
@@ -176,7 +266,19 @@ def process_new_battery_exchange(customer_phone, customer_name, old_serial, new_
         # 2. Update Old Battery
         old_battery = session.query(Battery).filter_by(serial_no=old_serial).first()
         if old_battery:
-            old_battery.status = 'returned_faulty'
+            old_battery.status = 'returned_faulty/WNA'
+            old_battery.has_loaner = False # Reset loaner flag if any
+            
+            # Add to Scrap Table
+            scrap = ScrapBattery(
+                serial_no=old_serial,
+                model_type=old_battery.model_type,
+                received_date=datetime.now().strftime("%Y-%m-%d"),
+                customer_phone=customer_phone,
+                ticket_id=ticket_id,
+                notes=f"Replaced with {new_serial}"
+            )
+            session.merge(scrap) # Use merge to handle potential duplicates gracefully
         
         # 3. Upsert New Battery
         p_date_str = purchase_date.strftime("%Y-%m-%d")
@@ -219,7 +321,7 @@ def process_new_battery_exchange(customer_phone, customer_name, old_serial, new_
     finally:
         session.close()
 
-def process_service_entry(customer_phone, customer_name, battery_serial, ticket_id, vehicle_no, purchase_date, notes):
+def process_service_entry(customer_phone, customer_name, battery_serial, ticket_id, vehicle_no, purchase_date, notes, has_loaner=False):
     session = get_session()
     try:
         # 1. Upsert Customer
@@ -239,6 +341,7 @@ def process_service_entry(customer_phone, customer_name, battery_serial, ticket_
             battery.ticket_id = ticket_id
             battery.vehicle_no = vehicle_no
             battery.date_of_purchase = p_date_str
+            battery.has_loaner = has_loaner
         else:
              battery = Battery(
                 serial_no=battery_serial,
@@ -246,18 +349,20 @@ def process_service_entry(customer_phone, customer_name, battery_serial, ticket_
                 current_owner_phone=customer_phone,
                 ticket_id=ticket_id,
                 vehicle_no=vehicle_no,
-                date_of_purchase=p_date_str
+                date_of_purchase=p_date_str,
+                has_loaner=has_loaner
             )
              session.add(battery)
 
         # 3. Exchange Record
+        loaner_note = " | Loaner Issued" if has_loaner else ""
         exchange = Exchange(
             date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             old_battery_serial=battery_serial,
             new_battery_serial=battery_serial,
             customer_phone=customer_phone,
             action_taken='SERVICE_PENDING',
-            notes=f"Ticket: {ticket_id}. {notes}"
+            notes=f"Ticket: {ticket_id}. {notes}{loaner_note}"
         )
         session.add(exchange)
         
@@ -269,12 +374,18 @@ def process_service_entry(customer_phone, customer_name, battery_serial, ticket_
     finally:
         session.close()
 
-def process_return_to_customer(serial, phone):
+def process_return_to_customer(serial, phone, return_loaner=False):
     session = get_session()
     try:
         battery = session.query(Battery).filter_by(serial_no=serial).first()
+        ticket_info = ""
         if battery:
             battery.status = 'active_with_customer'
+            battery.has_loaner = False # Reset flag
+            if battery.ticket_id:
+                ticket_info = f"Ticket: {battery.ticket_id}. "
+        
+        loaner_note = " | Loaner Returned" if return_loaner else ""
         
         exchange = Exchange(
             date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -282,7 +393,7 @@ def process_return_to_customer(serial, phone):
             new_battery_serial=None,
             customer_phone=phone,
             action_taken="RETURNED_TO_CUSTOMER",
-            notes="Service completed, battery returned."
+            notes=f"{ticket_info}Service completed, battery returned.{loaner_note}"
         )
         session.add(exchange)
         session.commit()

@@ -1,7 +1,6 @@
 import streamlit as st
+import pandas as pd
 from datetime import datetime
-import cv2
-import numpy as np
 from config import SHOP_NAME
 from auth import check_login
 from database import init_db
@@ -15,9 +14,18 @@ from services import (
     get_battery_details_df, get_battery_exchanges_df,
     get_customer_details_df, get_customer_batteries_df,
     get_customer_exchanges_df, add_inventory_stock,
-    get_pending_factory_stock_df, get_stock_receipt_history_df
+    get_pending_factory_stock_df, get_stock_receipt_history_df,
+    get_customer_by_phone, get_scrap_batteries_df,
+    move_scrap_to_challan, get_challan_batteries_df, clear_challan_to_archive
 )
 import streamlit.components.v1 as components
+
+# --- CONSTANTS ---
+BATTERY_MODELS = [
+    "Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold",
+    "Exide Epiq", "Exide Express", "Exide Drive", "Exide Eko",
+    "Exide Ride", "Exide Xplore"
+]
 
 # --- CALLBACKS ---
 def verify_claim_otp():
@@ -33,25 +41,6 @@ def verify_pickup_otp():
     else:
         st.error("Invalid OTP.")
 
-def decode_qr_image(image):
-    """Decodes QR code from an image using OpenCV."""
-    try:
-        # Convert the file to an opencv image.
-        file_bytes = np.asarray(bytearray(image.read()), dtype=np.uint8)
-        opencv_image = cv2.imdecode(file_bytes, 1)
-        
-        # Initialize the cv2 QRCode detector
-        detector = cv2.QRCodeDetector()
-        
-        # Detect and decode
-        data, bbox, _ = detector.detectAndDecode(opencv_image)
-        
-        if data:
-            return data
-        return None
-    except Exception as e:
-        st.error(f"Error decoding QR code: {e}")
-        return None
 
 # --- PAGE COMPONENTS ---
 def page_dashboard():
@@ -69,22 +58,56 @@ def page_dashboard():
     in_service = get_batteries_in_service()
     
     if in_service:
+        # Summary Table
+        data = []
+        for b in in_service:
+            data.append({
+                "Serial No": b.serial_no,
+                "Ticket ID": b.ticket_id,
+                "Vehicle No": b.vehicle_no,
+                "Status": b.status.upper(),
+                "Purchase Date": b.date_of_purchase,
+                "Age": calculate_age(b.date_of_purchase),
+                "Loaner": "YES" if b.has_loaner else "No"
+            })
+        df_active = pd.DataFrame(data)
+        st.dataframe(df_active, use_container_width=True)
+
         for battery in in_service:
             age_info = calculate_age(battery.date_of_purchase)
+            loaner_badge = " | 🔴 HAS LOANER" if battery.has_loaner else ""
             with st.expander(
-                    f"Battery: {battery.serial_no} | Vehicle: {battery.vehicle_no or 'N/A'} | Status: {battery.status.upper()}"):
+                    f"Battery: {battery.serial_no} | Vehicle: {battery.vehicle_no or 'N/A'} | Status: {battery.status.upper()}{loaner_badge}"):
                 st.write(f"**Ticket ID:** {battery.ticket_id or 'N/A'}")
                 st.write(f"**Age since Purchase:** {age_info}")
+                if battery.has_loaner:
+                    st.warning("⚠️ This customer has a temporary loaner battery.")
 
-                status_options = ['pending', 'ready_for_pickup', 'returned_faulty']
+                status_options = ['pending', 'ready_for_pickup', 'returned_faulty', 'issue_replacement']
+                
+                # Determine current index, default to 0 if not found or if status is something else
+                current_index = 0
+                if battery.status in status_options:
+                    current_index = status_options.index(battery.status)
+                
                 new_status = st.selectbox(
                     f"Update status for {battery.serial_no}",
                     status_options,
-                    index=status_options.index(battery.status) if battery.status in status_options else 0,
+                    index=current_index,
                     key=f"status_{battery.serial_no}"
                 )
 
-                if new_status != battery.status:
+                if new_status == 'issue_replacement':
+                    if st.button(f"Proceed to Replacement for {battery.serial_no}", key=f"btn_replace_{battery.serial_no}"):
+                        # Set session state variables to pre-fill the service page
+                        st.session_state.prefill_service = True
+                        st.session_state.prefill_old_serial = battery.serial_no
+                        st.session_state.prefill_phone = battery.current_owner_phone
+                        st.session_state.intent_issue_replacement = True
+                        # Redirect to Service page
+                        st.session_state.menu_selection = "Service"
+                        st.rerun()
+                elif new_status != battery.status:
                     if st.button(f"Save Status for {battery.serial_no}", key=f"btn_{battery.serial_no}"):
                         update_battery_status(battery.serial_no, new_status)
                         st.success(f"Status updated to {new_status}!")
@@ -171,40 +194,27 @@ def page_service():
 
             if st.button("Process Another Claim"):
                 st.session_state.exchange_complete = False
+                # Clear all temp data
+                keys_to_clear = ['temp_cust_name', 'temp_vehicle_no', 'intent_issue_replacement']
+                for k in keys_to_clear:
+                    if k in st.session_state:
+                        del st.session_state[k]
                 st.rerun()
             return
 
         st.subheader("1. Register Faulty Battery")
 
-        # Move camera logic OUTSIDE the form
-        col_cam, col_form = st.columns([1, 2])
-        
-        with col_cam:
-            st.write("📷 **Scan QR Code**")
-            img_file_buffer = None
-            if st.checkbox("Open Camera", key="cam_toggle_old_serial"):
-                img_file_buffer = st.camera_input("Scan QR Code for Serial", key="camera_old_serial", label_visibility="collapsed")
-            
-            if img_file_buffer is not None:
-                decoded_serial = decode_qr_image(img_file_buffer)
-                if decoded_serial:
-                    st.success(f"Scanned: {decoded_serial}")
-                    if 'scanned_old_serial' not in st.session_state or st.session_state.scanned_old_serial != decoded_serial:
-                        st.session_state.scanned_old_serial = decoded_serial
-                        st.rerun()
+        # Check for pre-fill data from dashboard redirection
+        default_phone = ""
+        default_old_serial = ""
+        if st.session_state.get("prefill_service"):
+            default_phone = st.session_state.get("prefill_phone", "")
+            default_old_serial = st.session_state.get("prefill_old_serial", "")
 
         with st.form("check_form"):
             col1, col2 = st.columns(2)
-            phone = col1.text_input("Customer Phone Number", max_chars=10)
-            
-            # Use session state value if available
-            default_old_serial = ""
-            if 'scanned_old_serial' in st.session_state:
-                default_old_serial = st.session_state.scanned_old_serial
-                st.info(f"Using Scanned Serial: {default_old_serial}")
-
-            old_serial = col2.text_input("Faulty Battery Serial No.", value=default_old_serial, key="old_serial_input")
-            
+            phone = col1.text_input("Customer Phone Number", value=default_phone, max_chars=10)
+            old_serial = col2.text_input("Faulty Battery Serial No.", value=default_old_serial)
             check_submit = st.form_submit_button("Verify Details & Send OTP")
 
         if check_submit:
@@ -227,12 +237,20 @@ def page_service():
                     st.session_state.temp_old_serial = old_serial
                     st.session_state.workflow = "CLAIM"
                     st.session_state.otp_verified = False
+                    
+                    # Fetch details for pre-filling next stage
+                    cust = get_customer_by_phone(phone)
+                    st.session_state.temp_cust_name = cust.name if cust else ""
+                    st.session_state.temp_vehicle_no = batt.vehicle_no if batt and batt.vehicle_no else ""
+                    
                     send_otp_simulation(phone, otp)
                     st.info("OTP sent to customer's phone.")
                     
-                    # Clear scanned state after successful submission
-                    if 'scanned_old_serial' in st.session_state:
-                        del st.session_state.scanned_old_serial
+                    # Clear prefill data after successful submission
+                    if st.session_state.get("prefill_service"):
+                        st.session_state.prefill_service = False
+                        st.session_state.prefill_phone = ""
+                        st.session_state.prefill_old_serial = ""
 
         if st.session_state.current_otp and not st.session_state.otp_verified and st.session_state.get(
                 'workflow') == "CLAIM":
@@ -241,27 +259,38 @@ def page_service():
 
         if st.session_state.otp_verified and st.session_state.get('workflow') == "CLAIM":
             st.subheader("Resolution")
+            
+            # Determine default selection based on intent
+            res_index = 0
+            if st.session_state.get("intent_issue_replacement"):
+                res_index = 1
+                
             action = st.radio("Select Resolution:",
-                              ["Keep for Service (Mark as Pending)", "Issue New Replacement Battery"])
+                              ["Keep for Service (Mark as Pending)", "Issue New Replacement Battery"],
+                              index=res_index)
 
             if action == "Issue New Replacement Battery":
-                with st.form("exchange_final"):
+                with st.container(border=True):
                     col_a, col_b = st.columns(2)
-                    cust_name = col_a.text_input("Customer Name")
-                    vehicle_no = col_b.text_input("Vehicle Registration No.")
+                    
+                    # Use temp values if available
+                    val_name = st.session_state.get("temp_cust_name", "")
+                    val_vehicle = st.session_state.get("temp_vehicle_no", "")
+                    
+                    cust_name = col_a.text_input("Customer Name", value=val_name)
+                    vehicle_no = col_b.text_input("Vehicle Registration No.", value=val_vehicle)
 
                     col_c, col_d = st.columns(2)
-                    
-                    new_serial = col_c.text_input("New Battery Serial Number", key="new_serial_input")
+                    new_serial = col_c.text_input("New Battery Serial Number")
                     ticket_id = col_d.text_input("Exide Ticket ID")
 
                     col_e, col_f = st.columns(2)
-                    new_model = col_e.selectbox("Battery Model",
-                                                ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+                    new_model = col_e.selectbox("Battery Model", BATTERY_MODELS)
                     purchase_date = col_f.date_input("Date of Purchase", value=datetime.now())
+                    col_f.caption(f"Age: {calculate_age(purchase_date.strftime('%Y-%m-%d'))}")
 
                     notes = st.text_area("Technician Notes", "Warranty replacement issued.")
-                    final_submit = st.form_submit_button("Complete Exchange")
+                    final_submit = st.button("Complete Exchange")
 
                     if final_submit:
                         if not new_serial or not ticket_id:
@@ -286,19 +315,34 @@ def page_service():
                                     'new_model': new_model, 'purchase_date': purchase_date.strftime("%Y-%m-%d"), 'notes': notes
                                 }
                                 st.session_state.exchange_complete = True
+                                # Clear intent flag
+                                if 'intent_issue_replacement' in st.session_state:
+                                    del st.session_state.intent_issue_replacement
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Error: {e}")
             else:
-                with st.form("repair_later"):
+                with st.container(border=True):
                     col_x, col_y = st.columns(2)
-                    cust_name = col_x.text_input("Customer Name")
+                    
+                    # Use temp values if available
+                    val_name = st.session_state.get("temp_cust_name", "")
+                    val_vehicle = st.session_state.get("temp_vehicle_no", "")
+                    
+                    cust_name = col_x.text_input("Customer Name", value=val_name)
                     ticket_id = col_y.text_input("Exide Ticket ID (If generated)")
                     col_z1, col_z2 = st.columns(2)
-                    vehicle_no = col_z1.text_input("Vehicle Registration No.")
+                    vehicle_no = col_z1.text_input("Vehicle Registration No.", value=val_vehicle)
                     purchase_date = col_z2.date_input("Date of Purchase", value=datetime.now())
+                    col_z2.caption(f"Age: {calculate_age(purchase_date.strftime('%Y-%m-%d'))}")
+                    
+                    # --- NEW FEATURE: TEMPORARY BATTERY (SIMPLE) ---
+                    st.markdown("---")
+                    st.write("🔋 **Temporary Battery (Loaner)**")
+                    give_loaner = st.checkbox("Issue a temporary battery to customer?")
+                    
                     notes = st.text_area("Initial Observation", "Keeping for service/charging.")
-                    repair_submit = st.form_submit_button("Log Entry - Battery Kept for Service")
+                    repair_submit = st.button("Log Entry - Battery Kept for Service")
 
                     if repair_submit:
                         try:
@@ -309,26 +353,19 @@ def page_service():
                                 ticket_id=ticket_id,
                                 vehicle_no=vehicle_no,
                                 purchase_date=purchase_date,
-                                notes=notes
+                                notes=notes,
+                                has_loaner=give_loaner
                             )
-                            st.info(f"Battery {st.session_state.temp_old_serial} is now marked as 'PENDING'.")
+                            msg = f"Battery {st.session_state.temp_old_serial} is now marked as 'PENDING'."
+                            if give_loaner:
+                                msg += " (Loaner Issued)"
+                            st.info(msg)
                             st.session_state.otp_verified = False
+                            # Clear intent flag
+                            if 'intent_issue_replacement' in st.session_state:
+                                del st.session_state.intent_issue_replacement
                         except Exception as e:
                             st.error(f"Error: {e}")
-            
-            # Add a separate expander for scanning new battery serial if needed
-            if action == "Issue New Replacement Battery":
-                 with st.expander("📷 Scan QR for New Battery Serial (Optional)"):
-                    img_file_buffer_new = None
-                    if st.checkbox("Enable Camera", key="cam_toggle_new_serial"):
-                        img_file_buffer_new = st.camera_input("Scan QR Code", key="camera_new_serial")
-                    
-                    if img_file_buffer_new is not None:
-                        decoded_new = decode_qr_image(img_file_buffer_new)
-                        if decoded_new:
-                            st.success(f"Scanned New Serial: {decoded_new}")
-                            st.info("Please copy and paste this into the 'New Battery Serial Number' field above.")
-                            st.code(decoded_new)
 
     with tab_pickup:
         st.subheader("Return Battery to Customer")
@@ -339,8 +376,20 @@ def page_service():
             if not ready_items.empty:
                 st.write("Items in service:")
                 ready_items['Age'] = ready_items['date_of_purchase'].apply(calculate_age)
-                st.dataframe(ready_items[['serial_no', 'status', 'ticket_id', 'vehicle_no', 'Age']])
+                # Show loaner status in table
+                ready_items['Loaner'] = ready_items['has_loaner'].apply(lambda x: "YES" if x else "No")
+                st.dataframe(ready_items[['serial_no', 'status', 'ticket_id', 'vehicle_no', 'Age', 'Loaner']])
+                
                 selected_serial = st.selectbox("Select Battery to Return", ready_items['serial_no'].tolist())
+                
+                # Check if selected battery has a loaner
+                selected_row = ready_items[ready_items['serial_no'] == selected_serial].iloc[0]
+                has_loaner = bool(selected_row['has_loaner'])
+                
+                return_loaner = False
+                if has_loaner:
+                    st.warning(f"⚠️ This service entry has a loaner battery marked.")
+                    return_loaner = st.checkbox(f"Confirm return of loaner battery?", value=True)
 
                 if st.button("Verify Customer & Send OTP for Pickup", key="pickup_send_otp"):
                     otp = generate_otp()
@@ -349,14 +398,21 @@ def page_service():
                     st.session_state.temp_pickup_serial = selected_serial
                     st.session_state.workflow = "PICKUP"
                     st.session_state.pickup_verified = False
+                    st.session_state.return_loaner_flag = return_loaner # Store this choice
                     send_otp_simulation(search_phone, otp)
 
                 if st.session_state.current_otp and st.session_state.get('workflow') == "PICKUP":
                     st.text_input("Enter OTP for Pickup", key="pickup_otp_input")
                     if st.button("Confirm Return to Customer", key="confirm_pickup_btn", on_click=verify_pickup_otp):
                         if st.session_state.get('pickup_verified'):
-                            if process_return_to_customer(st.session_state.temp_pickup_serial, search_phone):
+                            if process_return_to_customer(
+                                st.session_state.temp_pickup_serial, 
+                                search_phone,
+                                return_loaner=st.session_state.get('return_loaner_flag', False)
+                            ):
                                 st.success(f"Battery {st.session_state.temp_pickup_serial} returned successfully!")
+                                if st.session_state.get('return_loaner_flag'):
+                                    st.info("Loaner battery marked as returned.")
                                 st.session_state.current_otp = None
                                 st.session_state.workflow = None
                                 st.session_state.pickup_verified = False
@@ -402,25 +458,9 @@ def page_history():
 
 def page_inventory():
     st.title("📦 Quick Inventory Add")
-    
-    # Add QR Scanner for Inventory
-    st.subheader("Scan QR Code (Optional)")
-    img_file_buffer = None
-    if st.checkbox("Open Camera Scanner", key="cam_toggle_inventory"):
-        img_file_buffer = st.camera_input("Scan QR for Serial", key="camera_inventory")
-        
-    scanned_serial = None
-    if img_file_buffer is not None:
-        scanned_serial = decode_qr_image(img_file_buffer)
-        if scanned_serial:
-            st.success(f"Scanned: {scanned_serial}")
-    
     with st.form("add_stock"):
-        # Use scanned serial if available, otherwise empty
-        default_serial = scanned_serial if scanned_serial else ""
-        serial = st.text_input("Serial Number", value=default_serial)
-        
-        model = st.selectbox("Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+        serial = st.text_input("Serial Number")
+        model = st.selectbox("Model", BATTERY_MODELS)
         p_date = st.date_input("Date of Purchase (If pre-owned/return)", value=datetime.now())
         submit = st.form_submit_button("Add to Stock")
         if submit and serial:
@@ -433,26 +473,11 @@ def page_inventory():
 
 def page_stock_loan_exide():
     st.title("🏭 Stock Loan Exide")
-    
-    # Add QR Scanner for Stock Loan
-    st.subheader("Scan QR Code (Optional)")
-    img_file_buffer = None
-    if st.checkbox("Open Camera Scanner", key="cam_toggle_stock"):
-        img_file_buffer = st.camera_input("Scan QR for Serial", key="camera_stock_loan")
-        
-    scanned_serial = None
-    if img_file_buffer is not None:
-        scanned_serial = decode_qr_image(img_file_buffer)
-        if scanned_serial:
-            st.success(f"Scanned: {scanned_serial}")
-
     with st.form("add_stock_loan"):
         st.subheader("New Stock Request / Loan")
-        
-        default_serial = scanned_serial if scanned_serial else ""
-        serial = st.text_input("Serial Number", value=default_serial)
-
-        model = st.selectbox("Battery Model", ["Exide Mileage", "Exide Matrix", "Exide Eezy", "Exide Gold"])
+        serial = st.text_input("Serial Number")
+        model = st.selectbox("Battery Model", BATTERY_MODELS)
+        ticket_id = st.text_input("Ticket ID")
         req_date = st.date_input("Date", value=datetime.now())
         submit = st.form_submit_button("Add to Pending Stock")
         if submit:
@@ -467,7 +492,7 @@ def page_stock_loan_exide():
                         sold_date=None,
                         p_date=req_date.strftime("%Y-%m-%d"),
                         phone=None,
-                        ticket=None,
+                        ticket=ticket_id,
                         vehicle=None
                     )
                     st.success(f"Added {serial} to pending list.")
@@ -481,14 +506,16 @@ def page_stock_loan_exide():
 
     if not pending_stock.empty:
         for index, row in pending_stock.iterrows():
-            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+            col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 2])
             with col1:
                 st.write(f"**SN:** {row['serial_no']}")
             with col2:
                 st.write(f"**Model:** {row['model_type']}")
             with col3:
-                st.write(f"**Date:** {row['date_of_purchase']}")
+                st.write(f"**Ticket:** {row['ticket_id']}")
             with col4:
+                st.write(f"**Date:** {row['date_of_purchase']}")
+            with col5:
                 if st.button("Mark Received", key=f"recv_{row['serial_no']}"):
                     process_stock_reception(row['serial_no'], row['model_type'])
                     st.success(f"Stock {row['serial_no']} received!")
@@ -504,6 +531,62 @@ def page_stock_loan_exide():
     else:
         st.info("No stock receipt history found.")
 
+def page_scrap_batteries():
+    st.title("♻️ Scrap Batteries")
+    st.subheader("List of Scrap Batteries (Replaced)")
+    scrap_df = get_scrap_batteries_df()
+    
+    if not scrap_df.empty:
+        # Insert a boolean column for selection
+        scrap_df.insert(0, "Select", False)
+        
+        # Configure the editor to show checkboxes and disable editing other columns
+        edited_df = st.data_editor(
+            scrap_df,
+            column_config={
+                "Select": st.column_config.CheckboxColumn(
+                    "Add to Challan?",
+                    help="Select to move to challan",
+                    default=False,
+                )
+            },
+            disabled=[c for c in scrap_df.columns if c != "Select"],
+            hide_index=True,
+            use_container_width=True,
+            key="scrap_editor"
+        )
+        
+        selected_rows = edited_df[edited_df["Select"]]
+        
+        if not selected_rows.empty:
+            st.write(f"Selected {len(selected_rows)} items.")
+            if st.button("📦 Move Selected to Challan"):
+                serials_to_move = selected_rows['serial_no'].tolist()
+                if move_scrap_to_challan(serials_to_move):
+                    st.success(f"Successfully moved {len(serials_to_move)} batteries to Challan.")
+                    st.rerun()
+                else:
+                    st.error("Failed to move batteries.")
+    else:
+        st.info("No scrap batteries found.")
+
+def page_chalaan():
+    st.title("📜 Challan")
+    st.subheader("Challan List")
+    
+    challan_df = get_challan_batteries_df()
+    if not challan_df.empty:
+        st.dataframe(challan_df, use_container_width=True)
+        
+        st.markdown("---")
+        if st.button("🗑️ Clear Challan (Move to Audit)"):
+            if clear_challan_to_archive():
+                st.success("Challan cleared successfully! Records moved to audit.")
+                st.rerun()
+            else:
+                st.error("Failed to clear challan.")
+    else:
+        st.info("No batteries in Challan.")
 
 def main():
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
@@ -529,7 +612,20 @@ def main():
         st.session_state.authenticated = False
         st.rerun()
 
-    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Stock Loan Exide"])
+    # Handle menu selection redirection
+    # We check if a redirection is requested
+    if st.session_state.get("menu_selection"):
+        # We update the session state variable that the radio button is bound to
+        st.session_state.sidebar_menu = st.session_state.menu_selection
+        # Clear the trigger
+        st.session_state.menu_selection = None
+
+    # Initialize the sidebar_menu state if not present
+    if "sidebar_menu" not in st.session_state:
+        st.session_state.sidebar_menu = "Dashboard"
+
+    menu = st.sidebar.radio("Menu", ["Dashboard", "Service", "Search History", "Stock Loan Exide", "Scrap Batteries/Trnf", "Challan"], key="sidebar_menu")
+
     if menu == "Dashboard":
         page_dashboard()
     elif menu == "Service":
@@ -538,6 +634,10 @@ def main():
         page_history()
     elif menu == "Stock Loan Exide":
         page_stock_loan_exide()
+    elif menu == "Scrap Batteries/Trnf":
+        page_scrap_batteries()
+    elif menu == "Challan":
+        page_chalaan()
     #elif menu == "Add Inventory":
      #   page_inventory()
 
