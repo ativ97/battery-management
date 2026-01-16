@@ -590,6 +590,23 @@ def page_chalaan():
 
 def main():
     st.set_page_config(page_title="Exide Warranty System", page_icon="🔋")
+    
+    # --- PWA SUPPORT ---
+    st.markdown("""
+    <link rel="manifest" href="app/static/manifest.json">
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('app/static/sw.js').then(function(registration) {
+                    console.log('ServiceWorker registration successful with scope: ', registration.scope);
+                }, function(err) {
+                    console.log('ServiceWorker registration failed: ', err);
+                });
+            });
+        }
+    </script>
+    """, unsafe_allow_html=True)
+
     init_db()
 
     if 'authenticated' not in st.session_state:
